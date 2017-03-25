@@ -1,79 +1,82 @@
-/*
- * Copyright (C) 2012 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.android.nfc.handover;
 
 import android.app.Activity;
-import android.app.AlertDialog;
+import android.app.AlertDialog.Builder;
 import android.bluetooth.BluetoothDevice;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.DialogInterface;
+import android.content.DialogInterface.OnClickListener;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Resources;
 import android.os.Bundle;
-
-import com.android.nfc.R;
+import android.provider.Settings.System;
+import com.android.nfc.C0027R;
 
 public class ConfirmConnectActivity extends Activity {
     BluetoothDevice mDevice;
-    AlertDialog mAlert = null;
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        AlertDialog.Builder builder = new AlertDialog.Builder(this,
-                AlertDialog.THEME_DEVICE_DEFAULT_LIGHT);
-        Intent launchIntent = getIntent();
-        mDevice = launchIntent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-        if (mDevice == null) finish();
-        Resources res = getResources();
-        String deviceName = mDevice.getName() != null ? mDevice.getName() : "";
-        String confirmString = String.format(res.getString(R.string.confirm_pairing), deviceName);
-        builder.setMessage(confirmString)
-               .setCancelable(false)
-               .setPositiveButton(res.getString(R.string.pair_yes),
-                       new DialogInterface.OnClickListener() {
-                   public void onClick(DialogInterface dialog, int id) {
-                        Intent allowIntent = new Intent(BluetoothPeripheralHandover.ACTION_ALLOW_CONNECT);
-                        allowIntent.putExtra(BluetoothDevice.EXTRA_DEVICE, mDevice);
-                        sendBroadcast(allowIntent);
-                        ConfirmConnectActivity.this.mAlert = null;
-                        ConfirmConnectActivity.this.finish();
-                   }
-               })
-               .setNegativeButton(res.getString(R.string.pair_no),
-                       new DialogInterface.OnClickListener() {
-                   public void onClick(DialogInterface dialog, int id) {
-                       Intent denyIntent = new Intent(BluetoothPeripheralHandover.ACTION_DENY_CONNECT);
-                       denyIntent.putExtra(BluetoothDevice.EXTRA_DEVICE, mDevice);
-                       sendBroadcast(denyIntent);
-                       ConfirmConnectActivity.this.mAlert = null;
-                       ConfirmConnectActivity.this.finish();
-                   }
-               });
-        mAlert = builder.create();
-        mAlert.show();
+    final BroadcastReceiver mReceiver;
+    Context mcontext;
+
+    /* renamed from: com.android.nfc.handover.ConfirmConnectActivity.1 */
+    class C00381 implements OnClickListener {
+        C00381() {
+        }
+
+        public void onClick(DialogInterface dialog, int id) {
+            Intent denyIntent = new Intent("com.android.nfc.handover.action.DENY_CONNECT");
+            denyIntent.putExtra("android.bluetooth.device.extra.DEVICE", ConfirmConnectActivity.this.mDevice);
+            ConfirmConnectActivity.this.sendBroadcast(denyIntent);
+            ConfirmConnectActivity.this.finish();
+        }
     }
 
-    @Override
-    protected void onStop() {
-        super.onStop();
-        if (mAlert != null) {
-            mAlert.dismiss();
-            Intent denyIntent = new Intent(BluetoothPeripheralHandover.ACTION_DENY_CONNECT);
-            denyIntent.putExtra(BluetoothDevice.EXTRA_DEVICE, mDevice);
-            sendBroadcast(denyIntent);
+    /* renamed from: com.android.nfc.handover.ConfirmConnectActivity.2 */
+    class C00392 implements OnClickListener {
+        C00392() {
         }
+
+        public void onClick(DialogInterface dialog, int id) {
+            Intent allowIntent = new Intent("com.android.nfc.handover.action.ALLOW_CONNECT");
+            allowIntent.putExtra("android.bluetooth.device.extra.DEVICE", ConfirmConnectActivity.this.mDevice);
+            ConfirmConnectActivity.this.sendBroadcast(allowIntent);
+            ConfirmConnectActivity.this.finish();
+        }
+    }
+
+    /* renamed from: com.android.nfc.handover.ConfirmConnectActivity.3 */
+    class C00403 extends BroadcastReceiver {
+        C00403() {
+        }
+
+        public void onReceive(Context context, Intent intent) {
+            if (intent.getAction().equals("android.intent.action.AIRPLANE_MODE") && ConfirmConnectActivity.this.isAirplaneModeOn()) {
+                ConfirmConnectActivity.this.finish();
+            }
+        }
+    }
+
+    public ConfirmConnectActivity() {
+        this.mReceiver = new C00403();
+    }
+
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        this.mcontext = getApplicationContext();
+        this.mcontext.registerReceiver(this.mReceiver, new IntentFilter("android.intent.action.AIRPLANE_MODE"));
+        Builder builder = new Builder(this, 2);
+        this.mDevice = (BluetoothDevice) getIntent().getParcelableExtra("android.bluetooth.device.extra.DEVICE");
+        if (this.mDevice == null) {
+            finish();
+        }
+        Resources res = getResources();
+        String deviceName = this.mDevice.getName() != null ? this.mDevice.getName() : "";
+        builder.setMessage(String.format(res.getString(C0027R.string.confirm_pairing), new Object[]{deviceName})).setCancelable(false).setPositiveButton(res.getString(C0027R.string.pair_yes), new C00392()).setNegativeButton(res.getString(C0027R.string.pair_no), new C00381());
+        builder.create().show();
+    }
+
+    boolean isAirplaneModeOn() {
+        return System.getInt(this.mcontext.getContentResolver(), "airplane_mode_on", 0) == 1;
     }
 }

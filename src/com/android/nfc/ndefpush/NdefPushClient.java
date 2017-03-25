@@ -1,144 +1,154 @@
-/*
- * Copyright (C) 2011 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.android.nfc.ndefpush;
-
-import com.android.nfc.DeviceHost.LlcpSocket;
-import com.android.nfc.LlcpException;
-import com.android.nfc.NfcService;
 
 import android.nfc.NdefMessage;
 import android.util.Log;
-
+import com.android.nfc.DeviceHost.LlcpSocket;
+import com.android.nfc.LlcpException;
+import com.android.nfc.NfcService;
+import com.android.nfc.handover.HandoverService.Device;
 import java.io.IOException;
 import java.util.Arrays;
 
-/**
- * Simple client to push the local NDEF message to a server on the remote side of an
- * LLCP connection, using the Android Ndef Push Protocol.
- */
 public class NdefPushClient {
-    private static final String TAG = "NdefPushClient";
-    private static final int MIU = 128;
-    private static final boolean DBG = true;
-
-    private static final int DISCONNECTED = 0;
-    private static final int CONNECTING = 1;
     private static final int CONNECTED = 2;
-
-    final Object mLock = new Object();
-    // Variables below locked on mLock
-    private int mState = DISCONNECTED;
+    private static final int CONNECTING = 1;
+    private static final boolean DBG;
+    private static final int DISCONNECTED = 0;
+    private static final int MIU = 128;
+    private static final String TAG = "NdefPushClient";
+    final Object mLock;
     private LlcpSocket mSocket;
+    private int mState;
+
+    public NdefPushClient() {
+        this.mLock = new Object();
+        this.mState = DISCONNECTED;
+    }
+
+    static {
+        DBG = NdefPushServer.DBG;
+    }
 
     public void connect() throws IOException {
-        synchronized (mLock) {
-            if (mState != DISCONNECTED) {
+        synchronized (this.mLock) {
+            if (this.mState != 0) {
                 throw new IOException("Socket still in use.");
             }
-            mState = CONNECTING;
+            this.mState = CONNECTING;
         }
         NfcService service = NfcService.getInstance();
-        LlcpSocket sock = null;
-        if (DBG) Log.d(TAG, "about to create socket");
-        try {
-            sock = service.createLlcpSocket(0, MIU, 1, 1024);
-        } catch (LlcpException e) {
-            synchronized (mLock) {
-                mState = DISCONNECTED;
-            }
-            throw new IOException("Could not create socket.");
+        if (DBG) {
+            Log.d(TAG, "about to create socket");
         }
         try {
-            if (DBG) Log.d(TAG, "about to connect to service " + NdefPushServer.SERVICE_NAME);
-            sock.connectToService(NdefPushServer.SERVICE_NAME);
-        } catch (IOException e) {
-            if (sock != null) {
-                try {
-                    sock.close();
-                } catch (IOException e2) {
-
+            LlcpSocket sock = service.createLlcpSocket(DISCONNECTED, MIU, CONNECTING, Device.AUDIO_VIDEO_UNCATEGORIZED);
+            try {
+                if (DBG) {
+                    Log.d(TAG, "about to connect to service com.android.npp");
                 }
+                sock.connectToService("com.android.npp");
+                synchronized (this.mLock) {
+                    this.mSocket = sock;
+                    this.mState = CONNECTED;
+                }
+            } catch (IOException e) {
+                if (sock != null) {
+                    try {
+                        sock.close();
+                    } catch (IOException e2) {
+                    }
+                }
+                synchronized (this.mLock) {
+                }
+                this.mState = DISCONNECTED;
+                throw new IOException("Could not connect service.");
             }
-            synchronized (mLock) {
-                mState = DISCONNECTED;
+        } catch (LlcpException e3) {
+            synchronized (this.mLock) {
             }
-            throw new IOException("Could not connect service.");
-        }
-
-        synchronized (mLock) {
-            mSocket = sock;
-            mState = CONNECTED;
+            this.mState = DISCONNECTED;
+            throw new IOException("Could not create socket.");
         }
     }
 
     public boolean push(NdefMessage msg) {
-        LlcpSocket sock = null;
-        synchronized (mLock) {
-            if (mState != CONNECTED) {
+        LlcpSocket sock;
+        synchronized (this.mLock) {
+            if (this.mState != CONNECTED) {
                 Log.e(TAG, "Not connected to NPP.");
-                return false;
+                return DBG;
             }
-            sock = mSocket;
-        }
-        // We only handle a single immediate action for now
-        NdefPushProtocol proto = new NdefPushProtocol(msg, NdefPushProtocol.ACTION_IMMEDIATE);
-        byte[] buffer = proto.toByteArray();
-        int offset = 0;
-        int remoteMiu;
-
-        try {
-            remoteMiu = sock.getRemoteMiu();
-            if (DBG) Log.d(TAG, "about to send a " + buffer.length + " byte message");
-            while (offset < buffer.length) {
-                int length = Math.min(buffer.length - offset, remoteMiu);
-                byte[] tmpBuffer = Arrays.copyOfRange(buffer, offset, offset+length);
-                if (DBG) Log.d(TAG, "about to send a " + length + " byte packet");
-                sock.send(tmpBuffer);
-                offset += length;
-            }
-            return true;
-        } catch (IOException e) {
-            Log.e(TAG, "couldn't send tag");
-            if (DBG) Log.d(TAG, "exception:", e);
-        } finally {
-            if (sock != null) {
+            sock = this.mSocket;
+            byte[] buffer = new NdefPushProtocol(msg, (byte) 1).toByteArray();
+            int offset = DISCONNECTED;
+            try {
+                int remoteMiu = sock.getRemoteMiu();
+                if (DBG) {
+                    Log.d(TAG, "about to send a " + buffer.length + " byte message");
+                }
+                while (offset < buffer.length) {
+                    int length = Math.min(buffer.length - offset, remoteMiu);
+                    byte[] tmpBuffer = Arrays.copyOfRange(buffer, offset, offset + length);
+                    if (DBG) {
+                        Log.d(TAG, "about to send a " + length + " byte packet");
+                    }
+                    sock.send(tmpBuffer);
+                    offset += length;
+                }
+                if (sock != null) {
+                    try {
+                        if (DBG) {
+                            Log.d(TAG, "about to close");
+                        }
+                        sock.close();
+                    } catch (IOException e) {
+                    }
+                }
+                return true;
+            } catch (IOException e2) {
+                Log.e(TAG, "couldn't send tag");
+                if (DBG) {
+                    Log.d(TAG, "exception:", e2);
+                }
+                if (sock == null) {
+                    return DBG;
+                }
                 try {
-                    if (DBG) Log.d(TAG, "about to close");
+                    if (DBG) {
+                        Log.d(TAG, "about to close");
+                    }
                     sock.close();
-                } catch (IOException e) {
-                    // Ignore
+                    return DBG;
+                } catch (IOException e3) {
+                    return DBG;
+                }
+            } catch (Throwable th) {
+                if (sock != null) {
+                    try {
+                        if (DBG) {
+                            Log.d(TAG, "about to close");
+                        }
+                        sock.close();
+                    } catch (IOException e4) {
+                    }
                 }
             }
         }
-        return false;
     }
 
     public void close() {
-        synchronized (mLock) {
-            if (mSocket != null) {
+        synchronized (this.mLock) {
+            if (this.mSocket != null) {
                 try {
-                    if (DBG) Log.d(TAG, "About to close NPP socket.");
-                    mSocket.close();
+                    if (DBG) {
+                        Log.d(TAG, "About to close NPP socket.");
+                    }
+                    this.mSocket.close();
                 } catch (IOException e) {
-                    // Ignore
                 }
-                mSocket = null;
+                this.mSocket = null;
             }
-            mState = DISCONNECTED;
+            this.mState = DISCONNECTED;
         }
     }
 }

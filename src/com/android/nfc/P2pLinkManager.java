@@ -1,40 +1,9 @@
-/*
- * Copyright (C) 2011 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.android.nfc;
 
-import android.content.Intent;
-import android.content.pm.UserInfo;
-
-import com.android.nfc.beam.BeamManager;
-import com.android.nfc.beam.BeamSendService;
-import com.android.nfc.beam.BeamTransferRecord;
-
-import android.os.UserManager;
-import com.android.nfc.echoserver.EchoServer;
-import com.android.nfc.handover.HandoverClient;
-import com.android.nfc.handover.HandoverDataParser;
-import com.android.nfc.handover.HandoverServer;
-import com.android.nfc.ndefpush.NdefPushClient;
-import com.android.nfc.ndefpush.NdefPushServer;
-import com.android.nfc.snep.SnepClient;
-import com.android.nfc.snep.SnepMessage;
-import com.android.nfc.snep.SnepServer;
-
+import android.app.ActivityManager;
+import android.app.ActivityManager.RunningTaskInfo;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -44,676 +13,207 @@ import android.nfc.BeamShareData;
 import android.nfc.IAppCallback;
 import android.nfc.NdefMessage;
 import android.nfc.NdefRecord;
-import android.nfc.NfcAdapter;
 import android.os.AsyncTask;
 import android.os.Handler;
+import android.os.Handler.Callback;
 import android.os.Message;
-import android.os.SystemClock;
+import android.os.Process;
 import android.os.UserHandle;
+import android.sec.enterprise.auditlog.AuditLog;
 import android.util.Log;
+import com.android.nfc.echoserver.EchoServer;
+import com.android.nfc.handover.HandoverClient;
+import com.android.nfc.handover.HandoverManager;
+import com.android.nfc.handover.HandoverServer;
+import com.android.nfc.ndefpush.NdefPushClient;
+import com.android.nfc.ndefpush.NdefPushServer;
+import com.android.nfc.secSend.SecNdefService;
+import com.android.nfc.snep.SnepClient;
+import com.android.nfc.snep.SnepMessage;
+import com.android.nfc.snep.SnepServer;
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Hashtable;
 import java.util.List;
 
-/**
- * Interface to listen for P2P events.
- * All callbacks are made from the UI thread.
- */
-interface P2pEventListener {
-    /**
-     * Indicates the user has expressed an intent to share
-     * over NFC, but a remote device has not come into range
-     * yet. Prompt the user to NFC tap.
-     */
-    public void onP2pNfcTapRequested();
-
-    /**
-     * Indicates the user has expressed an intent to share over
-     * NFC, but the link hasn't come up yet and we no longer
-     * want to wait for it
-     */
-    public void onP2pTimeoutWaitingForLink();
-
-    /**
-     * Indicates a P2P device is in range.
-     * <p>onP2pInRange() and onP2pOutOfRange() will always be called
-     * alternately.
-     */
-    public void onP2pInRange();
-
-    /**
-     * Called when a NDEF payload is prepared to send, and confirmation is
-     * required. Call Callback.onP2pSendConfirmed() to make the confirmation.
-     */
-    public void onP2pSendConfirmationRequested();
-
-    /**
-     * Called to indicate a send was successful.
-     */
-    public void onP2pSendComplete();
-
-    /**
-     *
-     * Called to indicate the link has broken while we were trying to send
-     * a message. We'll start a debounce timer for the user to get the devices
-     * back together. UI may show a hint to achieve that
-     */
-    public void onP2pSendDebounce();
-
-    /**
-     * Called to indicate a link has come back up after being temporarily
-     * broken, and sending is resuming
-     */
-    public void onP2pResumeSend();
-
-    /**
-     * Called to indicate the remote device does not support connection handover
-     */
-    public void onP2pHandoverNotSupported();
-
-    /**
-     * Called to indicate the device is busy with another handover transfer
-     */
-    public void onP2pHandoverBusy();
-
-    /**
-     * Called to indicate a receive was successful.
-     */
-    public void onP2pReceiveComplete(boolean playSound);
-
-    /**
-     * Indicates the P2P device went out of range.
-     */
-    public void onP2pOutOfRange();
-
-    public interface Callback {
-        public void onP2pSendConfirmed();
-        public void onP2pCanceled();
-    }
-}
-
-/**
- * Manages sending and receiving NDEF message over LLCP link.
- * Does simple debouncing of the LLCP link - so that even if the link
- * drops and returns the user does not know.
- */
-class P2pLinkManager implements Handler.Callback, P2pEventListener.Callback {
-    static final String TAG = "NfcP2pLinkManager";
-    static final boolean DBG = true;
-
-    /** Include this constant as a meta-data entry in the manifest
-     *  of an application to disable beaming the market/AAR link, like this:
-     *  <pre>{@code
-     *  <application ...>
-     *      <meta-data android:name="android.nfc.disable_beam_default"
-     *          android:value="true" />
-     *  </application>
-     *  }</pre>
-     */
+public class P2pLinkManager implements Callback, P2pEventListener.Callback {
+    static final boolean DBG;
     static final String DISABLE_BEAM_DEFAULT = "android.nfc.disable_beam_default";
-
-    /** Enables the LLCP EchoServer, which can be used to test the android
-     * LLCP stack against nfcpy.
-     */
     static final boolean ECHOSERVER_ENABLED = false;
-
-    // TODO dynamically assign SAP values
-    static final int NDEFPUSH_SAP = 0x10;
-    static final int HANDOVER_SAP = 0x14;
-
-    static final int LINK_SEND_PENDING_DEBOUNCE_MS = 3000;
+    static final int HANDOVER_FAILURE = 1;
+    static final int HANDOVER_SAP = 20;
+    static final int HANDOVER_SUCCESS = 0;
+    static final int HANDOVER_UNSUPPORTED = 2;
+    static final int LINK_FIRST_PDU_LIMIT_MS = 200;
+    static final int LINK_NOTHING_TO_SEND_DEBOUNCE_MS = 750;
+    static final int LINK_SEND_COMPLETE_DEBOUNCE_MS = 250;
     static final int LINK_SEND_CONFIRMED_DEBOUNCE_MS = 5000;
-    static final int LINK_SEND_COMPLETE_DEBOUNCE_MS = 500;
-    static final int LINK_SEND_CANCELED_DEBOUNCE_MS = 250;
-
-    // The amount of time we wait for the link to come up
-    // after a user has manually invoked Beam.
-    static final int WAIT_FOR_LINK_TIMEOUT_MS = 10000;
-
+    static final int LINK_SEND_PENDING_DEBOUNCE_MS = 3000;
+    static final int LINK_STATE_DEBOUNCE = 4;
+    static final int LINK_STATE_DOWN = 1;
+    static final int LINK_STATE_UP = 3;
+    static final int LINK_STATE_WAITING_PDU = 2;
     static final int MSG_DEBOUNCE_TIMEOUT = 1;
+    static final int MSG_HANDOVER_NOT_SUPPORTED = 7;
     static final int MSG_RECEIVE_COMPLETE = 2;
     static final int MSG_RECEIVE_HANDOVER = 3;
+    static final int MSG_SEC_SEND_MSG = 9;
     static final int MSG_SEND_COMPLETE = 4;
+    static final int MSG_SHOW_CONFIRMATION_UI = 8;
     static final int MSG_START_ECHOSERVER = 5;
     static final int MSG_STOP_ECHOSERVER = 6;
-    static final int MSG_HANDOVER_NOT_SUPPORTED = 7;
-    static final int MSG_SHOW_CONFIRMATION_UI = 8;
-    static final int MSG_WAIT_FOR_LINK_TIMEOUT = 9;
-    static final int MSG_HANDOVER_BUSY = 10;
-
-    // values for mLinkState
-    static final int LINK_STATE_DOWN = 1;
-    static final int LINK_STATE_UP = 2;
-    static final int LINK_STATE_DEBOUNCE = 3;
-
-    // values for mSendState
-    static final int SEND_STATE_NOTHING_TO_SEND = 1;
+    static final int NDEFPUSH_SAP = 16;
     static final int SEND_STATE_NEED_CONFIRMATION = 2;
-    static final int SEND_STATE_PENDING = 3;
-    static final int SEND_STATE_SENDING = 4;
-    static final int SEND_STATE_COMPLETE = 5;
-    static final int SEND_STATE_CANCELED = 6;
-
-    // return values for doSnepProtocol
-    static final int SNEP_SUCCESS = 0;
+    static final int SEND_STATE_NOTHING_TO_SEND = 1;
+    static final int SEND_STATE_SENDING = 3;
+    static final int SEND_STATE_SEND_COMPLETE = 4;
     static final int SNEP_FAILURE = 1;
-
-    // return values for doHandover
-    static final int HANDOVER_SUCCESS = 0;
-    static final int HANDOVER_FAILURE = 1;
-    static final int HANDOVER_UNSUPPORTED = 2;
-    static final int HANDOVER_BUSY = 3;
-
-    final NdefPushServer mNdefPushServer;
-    final SnepServer mDefaultSnepServer;
-    final HandoverServer mHandoverServer;
-    final EchoServer mEchoServer;
+    static final int SNEP_SUCCESS = 0;
+    static final String TAG = "NfcP2pLinkManager";
+    final String ACTION_ABEAM_STATE_CHANGED;
+    final String EXTRA_ABEAM_STATE;
+    final ActivityManager mActivityManager;
+    Hashtable<String, String[]> mAllValidCallbackPackages;
+    IAppCallback mCallbackNdef;
+    Hashtable<String, IAppCallback> mCallbackNdefs;
+    ConnectTask mConnectTask;
     final Context mContext;
-    final P2pEventListener mEventListener;
-    final Handler mHandler;
-    final HandoverDataParser mHandoverDataParser;
-    final ForegroundUtils mForegroundUtils;
-
     final int mDefaultMiu;
     final int mDefaultRwSize;
-
-    // Locked on NdefP2pManager.this
-    PackageManager mPackageManager;
-    int mLinkState;
-    int mSendState;  // valid during LINK_STATE_UP or LINK_STATE_DEBOUNCE
-    boolean mIsSendEnabled;
-    boolean mIsReceiveEnabled;
-    NdefMessage mMessageToSend;  // not valid in SEND_STATE_NOTHING_TO_SEND
-    Uri[] mUrisToSend;  // not valid in SEND_STATE_NOTHING_TO_SEND
-    UserHandle mUserHandle; // not valid in SEND_STATE_NOTHING_TO_SEND
-    int mSendFlags; // not valid in SEND_STATE_NOTHING_TO_SEND
-    IAppCallback mCallbackNdef;
-    int mNdefCallbackUid;
-    SendTask mSendTask;
-    SharedPreferences mPrefs;
-    SnepClient mSnepClient;
+    final SnepServer.Callback mDefaultSnepCallback;
+    final SnepServer mDefaultSnepServer;
+    final EchoServer mEchoServer;
+    final P2pEventListener mEventListener;
+    boolean mFirstBeam;
+    final Handler mHandler;
+    final HandoverServer.Callback mHandoverCallback;
     HandoverClient mHandoverClient;
-    NdefPushClient mNdefPushClient;
-    ConnectTask mConnectTask;
-    boolean mLlcpServicesConnected;
+    final HandoverManager mHandoverManager;
+    final HandoverServer mHandoverServer;
+    boolean mIsReceiveEnabled;
+    boolean mIsSendEnabled;
     long mLastLlcpActivationTime;
-    byte mPeerLlcpVersion;
+    int mLinkState;
+    boolean mLlcpConnectDelayed;
+    boolean mLlcpServicesConnected;
+    NdefMessage mMessageToSend;
+    NdefPushClient mNdefPushClient;
+    final NdefPushServer mNdefPushServer;
+    final NdefPushServer.Callback mNppCallback;
+    PackageManager mPackageManager;
+    SharedPreferences mPrefs;
+    private SecNdefService mSecNdefService;
+    int mSendFlags;
+    int mSendState;
+    SendTask mSendTask;
+    SnepClient mSnepClient;
+    Uri[] mUrisToSend;
+    String[] mValidCallbackPackages;
 
-    public P2pLinkManager(Context context, HandoverDataParser handoverDataParser, int defaultMiu,
-            int defaultRwSize) {
-        mNdefPushServer = new NdefPushServer(NDEFPUSH_SAP, mNppCallback);
-        mDefaultSnepServer = new SnepServer(mDefaultSnepCallback, defaultMiu, defaultRwSize);
-        mHandoverServer = new HandoverServer(context, HANDOVER_SAP, handoverDataParser, mHandoverCallback);
-
-        if (ECHOSERVER_ENABLED) {
-            mEchoServer = new EchoServer();
-        } else {
-            mEchoServer = null;
+    /* renamed from: com.android.nfc.P2pLinkManager.1 */
+    class C00241 implements HandoverServer.Callback {
+        C00241() {
         }
-        mPackageManager = context.getPackageManager();
-        mContext = context;
-        mEventListener = new P2pEventManager(context, this);
-        mHandler = new Handler(this);
-        mLinkState = LINK_STATE_DOWN;
-        mSendState = SEND_STATE_NOTHING_TO_SEND;
-        mIsSendEnabled = false;
-        mIsReceiveEnabled = false;
-        mPrefs = context.getSharedPreferences(NfcService.PREF, Context.MODE_PRIVATE);
-        mHandoverDataParser = handoverDataParser;
-        mDefaultMiu = defaultMiu;
-        mDefaultRwSize = defaultRwSize;
-        mLlcpServicesConnected = false;
-        mNdefCallbackUid = -1;
-        mForegroundUtils = ForegroundUtils.getInstance();
-     }
 
-    /**
-     * May be called from any thread.
-     * Assumes that NFC is already on if any parameter is true.
-     */
-    public void enableDisable(boolean sendEnable, boolean receiveEnable) {
-        synchronized (this) {
-            if (!mIsReceiveEnabled && receiveEnable) {
-                mDefaultSnepServer.start();
-                mNdefPushServer.start();
-                mHandoverServer.start();
-                if (mEchoServer != null) {
-                    mHandler.sendEmptyMessage(MSG_START_ECHOSERVER);
-                }
-            } else if (mIsReceiveEnabled && !receiveEnable) {
-                if (DBG) Log.d(TAG, "enableDisable: llcp deactivate");
-                onLlcpDeactivated ();
-                mDefaultSnepServer.stop();
-                mNdefPushServer.stop();
-                mHandoverServer.stop();
-                if (mEchoServer != null) {
-                    mHandler.sendEmptyMessage(MSG_STOP_ECHOSERVER);
-                }
-            }
-            mIsSendEnabled = sendEnable;
-            mIsReceiveEnabled = receiveEnable;
+        public void onHandoverRequestReceived() {
+            P2pLinkManager.this.onReceiveHandover();
         }
     }
 
-    /**
-     * May be called from any thread.
-     * @return whether the LLCP link is in an active or debounce state
-     */
-    public boolean isLlcpActive() {
-        synchronized (this) {
-            return mLinkState != LINK_STATE_DOWN;
+    /* renamed from: com.android.nfc.P2pLinkManager.2 */
+    class C00252 implements NdefPushServer.Callback {
+        C00252() {
+        }
+
+        public void onMessageReceived(NdefMessage msg) {
+            P2pLinkManager.this.onReceiveComplete(msg);
         }
     }
 
-    /**
-     * Set NDEF callback for sending.
-     * May be called from any thread.
-     * NDEF callbacks may be set at any time (even if NFC is
-     * currently off or P2P send is currently off). They will become
-     * active as soon as P2P send is enabled.
-     */
-    public void setNdefCallback(IAppCallback callbackNdef, int callingUid) {
-        synchronized (this) {
-            mCallbackNdef = callbackNdef;
-            mNdefCallbackUid = callingUid;
+    /* renamed from: com.android.nfc.P2pLinkManager.3 */
+    class C00263 implements SnepServer.Callback {
+        C00263() {
         }
-    }
 
-
-    public void onManualBeamInvoke(BeamShareData shareData) {
-        synchronized (P2pLinkManager.this)    {
-            if (mLinkState != LINK_STATE_DOWN) {
-                return;
-            }
-            if (mForegroundUtils.getForegroundUids().contains(mNdefCallbackUid)) {
-                // Try to get data from the registered NDEF callback
-                prepareMessageToSend(false);
-            } else {
-                mMessageToSend = null;
-                mUrisToSend = null;
-            }
-            if (mMessageToSend == null && mUrisToSend == null && shareData != null) {
-                // No data from the NDEF callback, get data from ShareData
-                if (shareData.uris != null) {
-                    mUrisToSend = shareData.uris;
-                } else if (shareData.ndefMessage != null) {
-                    mMessageToSend = shareData.ndefMessage;
-                }
-
-                mUserHandle = shareData.userHandle;
-            }
-            if (mMessageToSend != null ||
-                    (mUrisToSend != null && mHandoverDataParser.isHandoverSupported())) {
-                mSendState = SEND_STATE_PENDING;
-                mEventListener.onP2pNfcTapRequested();
-                scheduleTimeoutLocked(MSG_WAIT_FOR_LINK_TIMEOUT, WAIT_FOR_LINK_TIMEOUT_MS);
-            }
+        public SnepMessage doPut(NdefMessage msg) {
+            P2pLinkManager.this.onReceiveComplete(msg);
+            return SnepMessage.getMessage(SnepMessage.RESPONSE_SUCCESS);
         }
-    }
 
-    /**
-     * Must be called on UI Thread.
-     */
-    public void onLlcpActivated(byte peerLlcpVersion) {
-        Log.i(TAG, "LLCP activated");
-        synchronized (P2pLinkManager.this) {
-            if (mEchoServer != null) {
-                mEchoServer.onLlcpActivated();
+        public SnepMessage doGet(int acceptableLength, NdefMessage msg) {
+            NdefMessage response = P2pLinkManager.this.mHandoverManager.tryHandoverRequest(msg);
+            if (response == null) {
+                return SnepMessage.getMessage(SnepMessage.RESPONSE_NOT_IMPLEMENTED);
             }
-            mLastLlcpActivationTime = SystemClock.elapsedRealtime();
-            mPeerLlcpVersion = peerLlcpVersion;
-            switch (mLinkState) {
-                case LINK_STATE_DOWN:
-                    if (DBG) Log.d(TAG, "onP2pInRange()");
-                    // Start taking a screenshot
-                    mEventListener.onP2pInRange();
-                    mLinkState = LINK_STATE_UP;
-                    // If we had a pending send (manual Beam invoke),
-                    // mark it as sending
-                    if (mSendState == SEND_STATE_PENDING) {
-                        mSendState = SEND_STATE_SENDING;
-                        mHandler.removeMessages(MSG_WAIT_FOR_LINK_TIMEOUT);
-                        // Immediately try to connect LLCP services
-                        connectLlcpServices();
-                    } else {
-                        mSendState = SEND_STATE_NOTHING_TO_SEND;
-                        prepareMessageToSend(true);
-                        if (mMessageToSend != null ||
-                                (mUrisToSend != null && mHandoverDataParser.isHandoverSupported())) {
-                            // We have data to send, connect LLCP services
-                            connectLlcpServices();
-                            if ((mSendFlags & NfcAdapter.FLAG_NDEF_PUSH_NO_CONFIRM) != 0) {
-                                mSendState = SEND_STATE_SENDING;
-                            } else {
-                                mSendState = SEND_STATE_NEED_CONFIRMATION;
-                            }
-                        }
-                    }
-                    break;
-                case LINK_STATE_UP:
-                    if (DBG) Log.d(TAG, "Duplicate onLlcpActivated()");
-                    return;
-                case LINK_STATE_DEBOUNCE:
-                    // Immediately connect and try to send again
-                    mLinkState = LINK_STATE_UP;
-                    if (mSendState == SEND_STATE_SENDING ||
-                            mSendState == SEND_STATE_NEED_CONFIRMATION) {
-                        // If we have something to send still, connect LLCP
-                        connectLlcpServices();
-                    }
-                    mHandler.removeMessages(MSG_DEBOUNCE_TIMEOUT);
-                    break;
-            }
-        }
-    }
-
-    /**
-     * Must be called on UI Thread.
-     */
-    public void onLlcpFirstPacketReceived() {
-        synchronized (P2pLinkManager.this) {
-            long totalTime = SystemClock.elapsedRealtime() - mLastLlcpActivationTime;
-            if (DBG) Log.d(TAG, "Took " + Long.toString(totalTime) + " to get first LLCP PDU");
-        }
-    }
-
-    public void onUserSwitched(int userId) {
-        // Update the cached package manager in case of user switch
-        synchronized (P2pLinkManager.this) {
-            try {
-                mPackageManager  = mContext.createPackageContextAsUser("android", 0,
-                        new UserHandle(userId)).getPackageManager();
-            } catch (NameNotFoundException e) {
-                Log.e(TAG, "Failed to retrieve PackageManager for user");
-            }
-        }
-    }
-
-    void prepareMessageToSend(boolean generatePlayLink) {
-        synchronized (P2pLinkManager.this) {
-            mMessageToSend = null;
-            mUrisToSend = null;
-            if (!mIsSendEnabled) {
-                return;
-            }
-
-            List<Integer> foregroundUids = mForegroundUtils.getForegroundUids();
-            if (foregroundUids.isEmpty()) {
-                Log.e(TAG, "Could not determine foreground UID.");
-                return;
-            }
-
-            if (isBeamDisabled(foregroundUids.get(0))) {
-                if (DBG) Log.d(TAG, "Beam is disabled by policy.");
-                return;
-            }
-
-            if (mCallbackNdef != null) {
-                if (foregroundUids.contains(mNdefCallbackUid)) {
-                    try {
-                        BeamShareData shareData = mCallbackNdef.createBeamShareData(mPeerLlcpVersion);
-                        mMessageToSend = shareData.ndefMessage;
-                        mUrisToSend = shareData.uris;
-                        mUserHandle = shareData.userHandle;
-                        mSendFlags = shareData.flags;
-                        return;
-                    } catch (Exception e) {
-                        Log.e(TAG, "Failed NDEF callback: ", e);
-                    }
-                } else {
-                    // This is not necessarily an error - we no longer unset callbacks from
-                    // the app process itself (to prevent IPC calls on every pause).
-                    // Hence it may simply be a stale callback.
-                    if (DBG) Log.d(TAG, "Last registered callback is not running in the foreground.");
-                }
-            }
-
-            // fall back to default NDEF for the foreground activity, unless the
-            // application disabled this explicitly in their manifest.
-            String[] pkgs = mPackageManager.getPackagesForUid(foregroundUids.get(0));
-            if (pkgs != null && pkgs.length >= 1) {
-                if (!generatePlayLink || beamDefaultDisabled(pkgs[0])) {
-                    if (DBG) Log.d(TAG, "Disabling default Beam behavior");
-                    mMessageToSend = null;
-                    mUrisToSend = null;
-                } else {
-                    mMessageToSend = createDefaultNdef(pkgs[0]);
-                    mUrisToSend = null;
-                }
-            }
-
-            if (DBG) Log.d(TAG, "mMessageToSend = " + mMessageToSend);
-            if (DBG) Log.d(TAG, "mUrisToSend = " + mUrisToSend);
-        }
-    }
-
-    private boolean isBeamDisabled(int uid) {
-        UserManager userManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
-        UserInfo userInfo = userManager.getUserInfo(UserHandle.getUserId(uid));
-        return userManager.hasUserRestriction(
-                        UserManager.DISALLOW_OUTGOING_BEAM, userInfo.getUserHandle());
-
-    }
-
-    boolean beamDefaultDisabled(String pkgName) {
-        try {
-            ApplicationInfo ai = mPackageManager.getApplicationInfo(pkgName,
-                    PackageManager.GET_META_DATA);
-            if (ai == null || ai.metaData == null) {
-                return false;
-            }
-            return ai.metaData.getBoolean(DISABLE_BEAM_DEFAULT);
-        } catch (NameNotFoundException e) {
-            return false;
-        }
-    }
-
-    NdefMessage createDefaultNdef(String pkgName) {
-        NdefRecord appUri = NdefRecord.createUri(Uri.parse(
-                "http://play.google.com/store/apps/details?id=" + pkgName + "&feature=beam"));
-        NdefRecord appRecord = NdefRecord.createApplicationRecord(pkgName);
-        return new NdefMessage(new NdefRecord[] { appUri, appRecord });
-    }
-
-    void disconnectLlcpServices() {
-        synchronized (this) {
-            if (mConnectTask != null) {
-                mConnectTask.cancel(true);
-                mConnectTask = null;
-            }
-            // Close any already connected LLCP clients
-            if (mNdefPushClient != null) {
-                mNdefPushClient.close();
-                mNdefPushClient = null;
-            }
-            if (mSnepClient != null) {
-                mSnepClient.close();
-                mSnepClient = null;
-            }
-            if (mHandoverClient != null) {
-                mHandoverClient.close();
-                mHandoverClient = null;
-            }
-            mLlcpServicesConnected = false;
-        }
-    }
-
-    /**
-     * Must be called on UI Thread.
-     */
-    public void onLlcpDeactivated() {
-        Log.i(TAG, "LLCP deactivated.");
-        synchronized (this) {
-            if (mEchoServer != null) {
-                mEchoServer.onLlcpDeactivated();
-            }
-
-            switch (mLinkState) {
-                case LINK_STATE_DOWN:
-                case LINK_STATE_DEBOUNCE:
-                    Log.i(TAG, "Duplicate onLlcpDectivated()");
-                    break;
-                case LINK_STATE_UP:
-                    // Debounce
-                    mLinkState = LINK_STATE_DEBOUNCE;
-                    int debounceTimeout = 0;
-                    switch (mSendState) {
-                        case SEND_STATE_NOTHING_TO_SEND:
-                            debounceTimeout = 0;
-                            break;
-                        case SEND_STATE_NEED_CONFIRMATION:
-                            debounceTimeout = LINK_SEND_PENDING_DEBOUNCE_MS;
-                            break;
-                        case SEND_STATE_SENDING:
-                            debounceTimeout = LINK_SEND_CONFIRMED_DEBOUNCE_MS;
-                            break;
-                        case SEND_STATE_COMPLETE:
-                            debounceTimeout = LINK_SEND_COMPLETE_DEBOUNCE_MS;
-                            break;
-                        case SEND_STATE_CANCELED:
-                            debounceTimeout = LINK_SEND_CANCELED_DEBOUNCE_MS;
-                    }
-                    scheduleTimeoutLocked(MSG_DEBOUNCE_TIMEOUT, debounceTimeout);
-                    if (mSendState == SEND_STATE_SENDING) {
-                        Log.e(TAG, "onP2pSendDebounce()");
-                        mEventListener.onP2pSendDebounce();
-                    }
-                    cancelSendNdefMessage();
-                    disconnectLlcpServices();
-                    break;
-            }
-         }
-     }
-
-    void onHandoverUnsupported() {
-        mHandler.sendEmptyMessage(MSG_HANDOVER_NOT_SUPPORTED);
-    }
-
-    void onHandoverBusy() {
-        mHandler.sendEmptyMessage(MSG_HANDOVER_BUSY);
-    }
-
-    void onSendComplete(NdefMessage msg, long elapsedRealtime) {
-        // Make callbacks on UI thread
-        mHandler.sendEmptyMessage(MSG_SEND_COMPLETE);
-    }
-
-    void sendNdefMessage() {
-        synchronized (this) {
-            cancelSendNdefMessage();
-            mSendTask = new SendTask();
-            mSendTask.execute();
-        }
-    }
-
-    void cancelSendNdefMessage() {
-        synchronized (P2pLinkManager.this) {
-            if (mSendTask != null) {
-                mSendTask.cancel(true);
-            }
-        }
-    }
-
-    void connectLlcpServices() {
-        synchronized (P2pLinkManager.this) {
-            if (mConnectTask != null) {
-                Log.e(TAG, "Still had a reference to mConnectTask!");
-            }
-            mConnectTask = new ConnectTask();
-            mConnectTask.execute();
-        }
-    }
-
-    // Must be called on UI-thread
-    void onLlcpServicesConnected() {
-        if (DBG) Log.d(TAG, "onLlcpServicesConnected");
-        synchronized (P2pLinkManager.this) {
-            if (mLinkState != LINK_STATE_UP) {
-                return;
-            }
-            mLlcpServicesConnected = true;
-            if (mSendState == SEND_STATE_NEED_CONFIRMATION) {
-                if (DBG) Log.d(TAG, "onP2pSendConfirmationRequested()");
-                mEventListener.onP2pSendConfirmationRequested();
-            } else if (mSendState == SEND_STATE_SENDING) {
-                mEventListener.onP2pResumeSend();
-                sendNdefMessage();
-            } else {
-                // Either nothing to send or canceled/complete, ignore
-            }
+            P2pLinkManager.this.onReceiveHandover();
+            return SnepMessage.getSuccessResponse(response);
         }
     }
 
     final class ConnectTask extends AsyncTask<Void, Void, Boolean> {
-        @Override
-        protected void onPostExecute(Boolean result)  {
+        ConnectTask() {
+        }
+
+        protected void onPostExecute(Boolean result) {
             if (isCancelled()) {
-                if (DBG) Log.d(TAG, "ConnectTask was cancelled");
-                return;
-            }
-            if (result) {
-                onLlcpServicesConnected();
+                if (P2pLinkManager.DBG) {
+                    Log.d(P2pLinkManager.TAG, "ConnectTask was cancelled");
+                }
+            } else if (result.booleanValue()) {
+                P2pLinkManager.this.onLlcpServicesConnected();
             } else {
-                Log.e(TAG, "Could not connect required NFC transports");
+                Log.e(P2pLinkManager.TAG, "Could not connect required NFC transports");
             }
         }
 
-        @Override
         protected Boolean doInBackground(Void... params) {
-            boolean needsHandover = false;
-            boolean needsNdef = false;
-            boolean success = false;
+            Boolean valueOf;
+            boolean needsHandover = P2pLinkManager.ECHOSERVER_ENABLED;
+            boolean needsNdef = P2pLinkManager.ECHOSERVER_ENABLED;
+            boolean success = P2pLinkManager.ECHOSERVER_ENABLED;
             HandoverClient handoverClient = null;
             SnepClient snepClient = null;
             NdefPushClient nppClient = null;
-
-            synchronized(P2pLinkManager.this) {
-                if (mUrisToSend != null) {
+            synchronized (P2pLinkManager.this) {
+                if (P2pLinkManager.this.mUrisToSend != null) {
                     needsHandover = true;
                 }
-
-                if (mMessageToSend != null) {
+                if (P2pLinkManager.this.mMessageToSend != null) {
                     needsNdef = true;
                 }
             }
-            // We know either is requested - otherwise this task
-            // wouldn't have been started.
             if (needsHandover) {
                 handoverClient = new HandoverClient();
                 try {
                     handoverClient.connect();
-                    success = true; // Regardless of NDEF result
+                    success = true;
                 } catch (IOException e) {
                     handoverClient = null;
                 }
             }
-
             if (needsNdef || (needsHandover && handoverClient == null)) {
                 snepClient = new SnepClient();
                 try {
                     snepClient.connect();
                     success = true;
-                } catch (IOException e) {
+                } catch (IOException e2) {
                     snepClient = null;
                 }
-
                 if (!success) {
                     nppClient = new NdefPushClient();
                     try {
                         nppClient.connect();
                         success = true;
-                    } catch (IOException e) {
+                    } catch (IOException e3) {
                         nppClient = null;
                     }
                 }
             }
-
             synchronized (P2pLinkManager.this) {
                 if (isCancelled()) {
-                    // Cancelled by onLlcpDeactivated on UI thread
                     if (handoverClient != null) {
                         handoverClient.close();
                     }
@@ -723,374 +223,1029 @@ class P2pLinkManager implements Handler.Callback, P2pEventListener.Callback {
                     if (nppClient != null) {
                         nppClient.close();
                     }
-                    return false;
+                    valueOf = Boolean.valueOf(P2pLinkManager.ECHOSERVER_ENABLED);
                 } else {
-                    // Once assigned, these are the responsibility of
-                    // the code on the UI thread to release - typically
-                    // through onLlcpDeactivated().
-                    mHandoverClient = handoverClient;
-                    mSnepClient = snepClient;
-                    mNdefPushClient = nppClient;
-                    return success;
+                    P2pLinkManager.this.mHandoverClient = handoverClient;
+                    P2pLinkManager.this.mSnepClient = snepClient;
+                    P2pLinkManager.this.mNdefPushClient = nppClient;
+                    valueOf = Boolean.valueOf(success);
                 }
             }
+            return valueOf;
         }
-    };
+    }
 
     final class SendTask extends AsyncTask<Void, Void, Void> {
+        HandoverClient handoverClient;
         NdefPushClient nppClient;
         SnepClient snepClient;
-        HandoverClient handoverClient;
 
-        int doHandover(Uri[] uris, UserHandle userHandle) throws IOException {
+        SendTask() {
+        }
+
+        int doHandover(Uri[] uris) throws IOException {
             NdefMessage response = null;
-            BeamManager beamManager = BeamManager.getInstance();
-
-            if (beamManager.isBeamInProgress()) {
-                return HANDOVER_BUSY;
+            NdefMessage request = P2pLinkManager.this.mHandoverManager.createHandoverRequestMessage();
+            if (request == null) {
+                return P2pLinkManager.SEND_STATE_NEED_CONFIRMATION;
             }
-
-            NdefMessage request = mHandoverDataParser.createHandoverRequestMessage();
-            if (request != null) {
-                if (handoverClient != null) {
-                    response = handoverClient.sendHandoverRequest(request);
-                }
-                if (response == null && snepClient != null) {
-                    // Remote device may not support handover service,
-                    // try the (deprecated) SNEP GET implementation
-                    // for devices running Android 4.1
-                    SnepMessage snepResponse = snepClient.get(request);
-                    response = snepResponse.getNdefMessage();
-                }
-                if (response == null) {
-                    return HANDOVER_UNSUPPORTED;
-                }
-            } else {
-                return HANDOVER_UNSUPPORTED;
+            if (this.handoverClient != null) {
+                response = this.handoverClient.sendHandoverRequest(request);
             }
-
-            if (!beamManager.startBeamSend(mContext,
-                    mHandoverDataParser.getOutgoingHandoverData(response), uris, userHandle)) {
-                return HANDOVER_BUSY;
+            if (response == null && this.snepClient != null) {
+                response = this.snepClient.get(request).getNdefMessage();
             }
-
-            return HANDOVER_SUCCESS;
+            if (response == null) {
+                return P2pLinkManager.SEND_STATE_NEED_CONFIRMATION;
+            }
+            P2pLinkManager.this.mHandoverManager.doHandoverUri(uris, response);
+            return P2pLinkManager.SNEP_SUCCESS;
         }
 
         int doSnepProtocol(NdefMessage msg) throws IOException {
-            if (msg != null) {
-                snepClient.put(msg);
-                return SNEP_SUCCESS;
-            } else {
-                return SNEP_FAILURE;
+            if (msg == null) {
+                return P2pLinkManager.SNEP_FAILURE;
             }
+            this.snepClient.put(msg);
+            return P2pLinkManager.SNEP_SUCCESS;
         }
 
-        @Override
-        public Void doInBackground(Void... args) {
-            NdefMessage m;
-            Uri[] uris;
-            UserHandle userHandle;
-            boolean result = false;
+        /* JADX WARNING: inconsistent code. */
+        /* Code decompiled incorrectly, please refer to instructions dump. */
+        public java.lang.Void doInBackground(java.lang.Void... r13) {
+            /*
+            r12 = this;
+            r11 = 0;
+            r10 = 3;
+            r3 = 0;
+            r9 = com.android.nfc.P2pLinkManager.this;
+            monitor-enter(r9);
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ all -> 0x00a5 }
+            r8 = r8.mLinkState;	 Catch:{ all -> 0x00a5 }
+            if (r8 != r10) goto L_0x0012;
+        L_0x000c:
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ all -> 0x00a5 }
+            r8 = r8.mSendState;	 Catch:{ all -> 0x00a5 }
+            if (r8 == r10) goto L_0x0014;
+        L_0x0012:
+            monitor-exit(r9);	 Catch:{ all -> 0x00a5 }
+        L_0x0013:
+            return r11;
+        L_0x0014:
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ all -> 0x00a5 }
+            r2 = r8.mMessageToSend;	 Catch:{ all -> 0x00a5 }
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ all -> 0x00a5 }
+            r7 = r8.mUrisToSend;	 Catch:{ all -> 0x00a5 }
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ all -> 0x00a5 }
+            r8 = r8.mSnepClient;	 Catch:{ all -> 0x00a5 }
+            r12.snepClient = r8;	 Catch:{ all -> 0x00a5 }
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ all -> 0x00a5 }
+            r8 = r8.mHandoverClient;	 Catch:{ all -> 0x00a5 }
+            r12.handoverClient = r8;	 Catch:{ all -> 0x00a5 }
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ all -> 0x00a5 }
+            r8 = r8.mNdefPushClient;	 Catch:{ all -> 0x00a5 }
+            r12.nppClient = r8;	 Catch:{ all -> 0x00a5 }
+            monitor-exit(r9);	 Catch:{ all -> 0x00a5 }
+            r5 = android.os.SystemClock.elapsedRealtime();
+            if (r7 == 0) goto L_0x0047;
+        L_0x0035:
+            r8 = com.android.nfc.P2pLinkManager.DBG;
+            if (r8 == 0) goto L_0x0040;
+        L_0x0039:
+            r8 = "NfcP2pLinkManager";
+            r9 = "Trying handover request";
+            android.util.Log.d(r8, r9);
+        L_0x0040:
+            r1 = r12.doHandover(r7);	 Catch:{ IOException -> 0x00b3 }
+            switch(r1) {
+                case 0: goto L_0x00a8;
+                case 1: goto L_0x00aa;
+                case 2: goto L_0x00ac;
+                default: goto L_0x0047;
+            };
+        L_0x0047:
+            if (r3 != 0) goto L_0x0062;
+        L_0x0049:
+            if (r2 == 0) goto L_0x0062;
+        L_0x004b:
+            r8 = r12.snepClient;
+            if (r8 == 0) goto L_0x0062;
+        L_0x004f:
+            r8 = com.android.nfc.P2pLinkManager.DBG;
+            if (r8 == 0) goto L_0x005a;
+        L_0x0053:
+            r8 = "NfcP2pLinkManager";
+            r9 = "Sending ndef via SNEP";
+            android.util.Log.d(r8, r9);
+        L_0x005a:
+            r4 = r12.doSnepProtocol(r2);	 Catch:{ IOException -> 0x00ba }
+            switch(r4) {
+                case 0: goto L_0x00b6;
+                case 1: goto L_0x00b8;
+                default: goto L_0x0061;
+            };
+        L_0x0061:
+            r3 = 0;
+        L_0x0062:
+            if (r3 != 0) goto L_0x0070;
+        L_0x0064:
+            if (r2 == 0) goto L_0x0070;
+        L_0x0066:
+            r8 = r12.nppClient;
+            if (r8 == 0) goto L_0x0070;
+        L_0x006a:
+            r8 = r12.nppClient;
+            r3 = r8.push(r2);
+        L_0x0070:
+            r8 = android.os.SystemClock.elapsedRealtime();
+            r5 = r8 - r5;
+            r8 = com.android.nfc.P2pLinkManager.DBG;
+            if (r8 == 0) goto L_0x009c;
+        L_0x007a:
+            r8 = "NfcP2pLinkManager";
+            r9 = new java.lang.StringBuilder;
+            r9.<init>();
+            r10 = "SendTask result=";
+            r9 = r9.append(r10);
+            r9 = r9.append(r3);
+            r10 = ", time ms=";
+            r9 = r9.append(r10);
+            r9 = r9.append(r5);
+            r9 = r9.toString();
+            android.util.Log.d(r8, r9);
+        L_0x009c:
+            if (r3 == 0) goto L_0x0013;
+        L_0x009e:
+            r8 = com.android.nfc.P2pLinkManager.this;
+            r8.onSendComplete(r2, r5);
+            goto L_0x0013;
+        L_0x00a5:
+            r8 = move-exception;
+            monitor-exit(r9);	 Catch:{ all -> 0x00a5 }
+            throw r8;
+        L_0x00a8:
+            r3 = 1;
+            goto L_0x0047;
+        L_0x00aa:
+            r3 = 0;
+            goto L_0x0047;
+        L_0x00ac:
+            r3 = 0;
+            r8 = com.android.nfc.P2pLinkManager.this;	 Catch:{ IOException -> 0x00b3 }
+            r8.onHandoverUnsupported();	 Catch:{ IOException -> 0x00b3 }
+            goto L_0x0047;
+        L_0x00b3:
+            r0 = move-exception;
+            r3 = 0;
+            goto L_0x0047;
+        L_0x00b6:
+            r3 = 1;
+            goto L_0x0062;
+        L_0x00b8:
+            r3 = 0;
+            goto L_0x0062;
+        L_0x00ba:
+            r0 = move-exception;
+            r3 = 0;
+            goto L_0x0062;
+            */
+            throw new UnsupportedOperationException("Method not decompiled: com.android.nfc.P2pLinkManager.SendTask.doInBackground(java.lang.Void[]):java.lang.Void");
+        }
+    }
 
-            synchronized (P2pLinkManager.this) {
-                if (mLinkState != LINK_STATE_UP || mSendState != SEND_STATE_SENDING) {
-                    return null;
+    static {
+        DBG = NfcService.DBG;
+    }
+
+    public P2pLinkManager(Context context, HandoverManager handoverManager, int defaultMiu, int defaultRwSize) {
+        this.ACTION_ABEAM_STATE_CHANGED = "android.nfc.action.ABEAM_STATE_CHANGED";
+        this.EXTRA_ABEAM_STATE = "android.nfc.extra.ABEAM_STATE";
+        this.mHandoverCallback = new C00241();
+        this.mNppCallback = new C00252();
+        this.mDefaultSnepCallback = new C00263();
+        this.mNdefPushServer = new NdefPushServer(NDEFPUSH_SAP, this.mNppCallback);
+        this.mDefaultSnepServer = new SnepServer(this.mDefaultSnepCallback, defaultMiu, defaultRwSize);
+        this.mHandoverServer = new HandoverServer(HANDOVER_SAP, handoverManager, this.mHandoverCallback);
+        this.mEchoServer = null;
+        this.mActivityManager = (ActivityManager) context.getSystemService("activity");
+        this.mPackageManager = context.getPackageManager();
+        this.mContext = context;
+        this.mEventListener = new P2pEventManager(context, this);
+        this.mHandler = new Handler(this);
+        this.mLinkState = SNEP_FAILURE;
+        this.mSendState = SNEP_FAILURE;
+        this.mIsSendEnabled = ECHOSERVER_ENABLED;
+        this.mIsReceiveEnabled = ECHOSERVER_ENABLED;
+        this.mPrefs = context.getSharedPreferences(NfcService.PREF, SNEP_SUCCESS);
+        this.mFirstBeam = this.mPrefs.getBoolean("first_beam", true);
+        this.mHandoverManager = handoverManager;
+        this.mDefaultMiu = defaultMiu;
+        this.mDefaultRwSize = defaultRwSize;
+        this.mLlcpServicesConnected = ECHOSERVER_ENABLED;
+        this.mSecNdefService = new SecNdefService(this.mContext, this.mIsSendEnabled, this.mIsReceiveEnabled);
+        this.mCallbackNdefs = new Hashtable();
+        this.mAllValidCallbackPackages = new Hashtable();
+    }
+
+    public void enableDisable(boolean sendEnable, boolean receiveEnable) {
+        synchronized (this) {
+            if (!this.mIsReceiveEnabled && receiveEnable) {
+                this.mDefaultSnepServer.start();
+                this.mNdefPushServer.start();
+                this.mHandoverServer.start();
+                if (this.mEchoServer != null) {
+                    this.mHandler.sendEmptyMessage(MSG_START_ECHOSERVER);
                 }
-                m = mMessageToSend;
-                uris = mUrisToSend;
-                userHandle = mUserHandle;
-                snepClient = mSnepClient;
-                handoverClient = mHandoverClient;
-                nppClient = mNdefPushClient;
+            } else if (this.mIsReceiveEnabled && !receiveEnable) {
+                if (DBG) {
+                    Log.d(TAG, "enableDisable: llcp deactivate");
+                }
+                onLlcpDeactivated();
+                this.mDefaultSnepServer.stop();
+                this.mNdefPushServer.stop();
+                this.mHandoverServer.stop();
+                if (this.mEchoServer != null) {
+                    this.mHandler.sendEmptyMessage(MSG_STOP_ECHOSERVER);
+                }
             }
+            this.mIsSendEnabled = sendEnable;
+            this.mIsReceiveEnabled = receiveEnable;
+            this.mSecNdefService.enableDisable(sendEnable, receiveEnable);
+        }
+    }
 
-            long time = SystemClock.elapsedRealtime();
+    public boolean isLlcpActive() {
+        boolean z = true;
+        synchronized (this) {
+            if (this.mLinkState == SNEP_FAILURE) {
+                z = ECHOSERVER_ENABLED;
+            }
+        }
+        return z;
+    }
 
-            if (uris != null) {
-                if (DBG) Log.d(TAG, "Trying handover request");
-                try {
-                    int handoverResult = doHandover(uris, userHandle);
-                    switch (handoverResult) {
-                        case HANDOVER_SUCCESS:
-                            result = true;
-                            break;
-                        case HANDOVER_FAILURE:
-                            result = false;
-                            break;
-                        case HANDOVER_UNSUPPORTED:
-                            result = false;
-                            onHandoverUnsupported();
-                            break;
-                        case HANDOVER_BUSY:
-                            result = false;
-                            onHandoverBusy();
-                            break;
+    public void sendBeamChangeIntent(boolean enable) {
+        if (DBG) {
+            Log.i(TAG, "send Android beam state change intent : " + enable);
+        }
+        Intent intent = new Intent("android.nfc.action.ABEAM_STATE_CHANGED");
+        intent.putExtra("android.nfc.extra.ABEAM_STATE", enable);
+        this.mContext.sendBroadcast(intent);
+    }
+
+    public void setNdefCallback(IAppCallback callbackNdef, int callingUid) {
+        synchronized (this) {
+            this.mCallbackNdef = callbackNdef;
+            this.mValidCallbackPackages = this.mPackageManager.getPackagesForUid(callingUid);
+            String runningPackage = null;
+            List<RunningTaskInfo> tasks = this.mActivityManager.getRunningTasks(SNEP_FAILURE);
+            if (tasks.size() > 0) {
+                runningPackage = ((RunningTaskInfo) tasks.get(SNEP_SUCCESS)).topActivity.getPackageName();
+            }
+            boolean callbackValidCheck = ECHOSERVER_ENABLED;
+            String[] arr$ = this.mValidCallbackPackages;
+            int len$ = arr$.length;
+            for (int i$ = SNEP_SUCCESS; i$ < len$; i$ += SNEP_FAILURE) {
+                if (arr$[i$].equals(runningPackage)) {
+                    callbackValidCheck = true;
+                    break;
+                }
+            }
+            if (callbackValidCheck) {
+                this.mCallbackNdefs.put(runningPackage, this.mCallbackNdef);
+                this.mAllValidCallbackPackages.put(runningPackage, this.mValidCallbackPackages);
+                if (DBG) {
+                    Log.i(TAG, "NFC runningPackage is " + runningPackage);
+                }
+                if (DBG) {
+                    Log.i(TAG, "NFC mCallbackNdefs size" + this.mCallbackNdefs.size());
+                }
+                if (DBG) {
+                    Log.i(TAG, "NFC mValidCallbackPackage[0] is " + this.mValidCallbackPackages[SNEP_SUCCESS]);
+                }
+            }
+        }
+    }
+
+    /* JADX WARNING: inconsistent code. */
+    /* Code decompiled incorrectly, please refer to instructions dump. */
+    public void onLlcpActivated() {
+        /*
+        r3 = this;
+        r2 = 3;
+        r0 = "NfcP2pLinkManager";
+        r1 = "LLCP activated";
+        android.util.Log.i(r0, r1);
+        monitor-enter(r3);
+        r0 = r3.mEchoServer;	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x0012;
+    L_0x000d:
+        r0 = r3.mEchoServer;	 Catch:{ all -> 0x0062 }
+        r0.onLlcpActivated();	 Catch:{ all -> 0x0062 }
+    L_0x0012:
+        r0 = android.os.SystemClock.elapsedRealtime();	 Catch:{ all -> 0x0062 }
+        r3.mLastLlcpActivationTime = r0;	 Catch:{ all -> 0x0062 }
+        r0 = 0;
+        r3.mLlcpConnectDelayed = r0;	 Catch:{ all -> 0x0062 }
+        r0 = r3.mLinkState;	 Catch:{ all -> 0x0062 }
+        switch(r0) {
+            case 1: goto L_0x0022;
+            case 2: goto L_0x0079;
+            case 3: goto L_0x0086;
+            case 4: goto L_0x0093;
+            default: goto L_0x0020;
+        };	 Catch:{ all -> 0x0062 }
+    L_0x0020:
+        monitor-exit(r3);	 Catch:{ all -> 0x0062 }
+    L_0x0021:
+        return;
+    L_0x0022:
+        r0 = 2;
+        r3.mLinkState = r0;	 Catch:{ all -> 0x0062 }
+        r0 = 1;
+        r3.mSendState = r0;	 Catch:{ all -> 0x0062 }
+        r0 = DBG;	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x0033;
+    L_0x002c:
+        r0 = "NfcP2pLinkManager";
+        r1 = "onP2pInRange()";
+        android.util.Log.d(r0, r1);	 Catch:{ all -> 0x0062 }
+    L_0x0033:
+        r0 = com.android.nfc.NfcService.mIsSecNdefEnabled;	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x003c;
+    L_0x0037:
+        r0 = r3.mSecNdefService;	 Catch:{ all -> 0x0062 }
+        r0.onP2pInRange();	 Catch:{ all -> 0x0062 }
+    L_0x003c:
+        r0 = r3.mEventListener;	 Catch:{ all -> 0x0062 }
+        r0.onP2pInRange();	 Catch:{ all -> 0x0062 }
+        r3.prepareMessageToSend();	 Catch:{ all -> 0x0062 }
+        r0 = r3.mMessageToSend;	 Catch:{ all -> 0x0062 }
+        if (r0 != 0) goto L_0x0054;
+    L_0x0048:
+        r0 = r3.mUrisToSend;	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x0020;
+    L_0x004c:
+        r0 = r3.mHandoverManager;	 Catch:{ all -> 0x0062 }
+        r0 = r0.isHandoverSupported();	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x0020;
+    L_0x0054:
+        r0 = r3.mSendFlags;	 Catch:{ all -> 0x0062 }
+        r0 = r0 & 1;
+        if (r0 == 0) goto L_0x0065;
+    L_0x005a:
+        r0 = 3;
+        r3.mSendState = r0;	 Catch:{ all -> 0x0062 }
+        r0 = 0;
+        r3.onP2pSendConfirmed(r0);	 Catch:{ all -> 0x0062 }
+        goto L_0x0020;
+    L_0x0062:
+        r0 = move-exception;
+        monitor-exit(r3);	 Catch:{ all -> 0x0062 }
+        throw r0;
+    L_0x0065:
+        r0 = 2;
+        r3.mSendState = r0;	 Catch:{ all -> 0x0062 }
+        r0 = DBG;	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x0073;
+    L_0x006c:
+        r0 = "NfcP2pLinkManager";
+        r1 = "onP2pSendConfirmationRequested()";
+        android.util.Log.d(r0, r1);	 Catch:{ all -> 0x0062 }
+    L_0x0073:
+        r0 = r3.mEventListener;	 Catch:{ all -> 0x0062 }
+        r0.onP2pSendConfirmationRequested();	 Catch:{ all -> 0x0062 }
+        goto L_0x0020;
+    L_0x0079:
+        r0 = DBG;	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x0084;
+    L_0x007d:
+        r0 = "NfcP2pLinkManager";
+        r1 = "Unexpected onLlcpActivated() in LINK_STATE_WAITING_PDU";
+        android.util.Log.d(r0, r1);	 Catch:{ all -> 0x0062 }
+    L_0x0084:
+        monitor-exit(r3);	 Catch:{ all -> 0x0062 }
+        goto L_0x0021;
+    L_0x0086:
+        r0 = DBG;	 Catch:{ all -> 0x0062 }
+        if (r0 == 0) goto L_0x0091;
+    L_0x008a:
+        r0 = "NfcP2pLinkManager";
+        r1 = "Duplicate onLlcpActivated()";
+        android.util.Log.d(r0, r1);	 Catch:{ all -> 0x0062 }
+    L_0x0091:
+        monitor-exit(r3);	 Catch:{ all -> 0x0062 }
+        goto L_0x0021;
+    L_0x0093:
+        r0 = r3.mSendState;	 Catch:{ all -> 0x0062 }
+        if (r0 != r2) goto L_0x00a5;
+    L_0x0097:
+        r0 = 3;
+        r3.mLinkState = r0;	 Catch:{ all -> 0x0062 }
+        r3.connectLlcpServices();	 Catch:{ all -> 0x0062 }
+    L_0x009d:
+        r0 = r3.mHandler;	 Catch:{ all -> 0x0062 }
+        r1 = 1;
+        r0.removeMessages(r1);	 Catch:{ all -> 0x0062 }
+        goto L_0x0020;
+    L_0x00a5:
+        r0 = 2;
+        r3.mLinkState = r0;	 Catch:{ all -> 0x0062 }
+        goto L_0x009d;
+        */
+        throw new UnsupportedOperationException("Method not decompiled: com.android.nfc.P2pLinkManager.onLlcpActivated():void");
+    }
+
+    /* JADX WARNING: inconsistent code. */
+    /* Code decompiled incorrectly, please refer to instructions dump. */
+    public void onLlcpFirstPacketReceived() {
+        /*
+        r8 = this;
+        r7 = 3;
+        r6 = 1;
+        monitor-enter(r8);
+        r2 = android.os.SystemClock.elapsedRealtime();	 Catch:{ all -> 0x0044 }
+        r4 = r8.mLastLlcpActivationTime;	 Catch:{ all -> 0x0044 }
+        r0 = r2 - r4;
+        r2 = DBG;	 Catch:{ all -> 0x0044 }
+        if (r2 == 0) goto L_0x0031;
+    L_0x000f:
+        r2 = "NfcP2pLinkManager";
+        r3 = new java.lang.StringBuilder;	 Catch:{ all -> 0x0044 }
+        r3.<init>();	 Catch:{ all -> 0x0044 }
+        r4 = "Took ";
+        r3 = r3.append(r4);	 Catch:{ all -> 0x0044 }
+        r4 = java.lang.Long.toString(r0);	 Catch:{ all -> 0x0044 }
+        r3 = r3.append(r4);	 Catch:{ all -> 0x0044 }
+        r4 = " to get first LLCP PDU";
+        r3 = r3.append(r4);	 Catch:{ all -> 0x0044 }
+        r3 = r3.toString();	 Catch:{ all -> 0x0044 }
+        android.util.Log.d(r2, r3);	 Catch:{ all -> 0x0044 }
+    L_0x0031:
+        r2 = r8.mLinkState;	 Catch:{ all -> 0x0044 }
+        switch(r2) {
+            case 1: goto L_0x0047;
+            case 2: goto L_0x004f;
+            case 3: goto L_0x0038;
+            case 4: goto L_0x0047;
+            default: goto L_0x0036;
+        };	 Catch:{ all -> 0x0044 }
+    L_0x0036:
+        monitor-exit(r8);	 Catch:{ all -> 0x0044 }
+        return;
+    L_0x0038:
+        r2 = DBG;	 Catch:{ all -> 0x0044 }
+        if (r2 == 0) goto L_0x0036;
+    L_0x003c:
+        r2 = "NfcP2pLinkManager";
+        r3 = "Dropping first LLCP packet received";
+        android.util.Log.d(r2, r3);	 Catch:{ all -> 0x0044 }
+        goto L_0x0036;
+    L_0x0044:
+        r2 = move-exception;
+        monitor-exit(r8);	 Catch:{ all -> 0x0044 }
+        throw r2;
+    L_0x0047:
+        r2 = "NfcP2pLinkManager";
+        r3 = "Unexpected first LLCP packet received";
+        android.util.Log.e(r2, r3);	 Catch:{ all -> 0x0044 }
+        goto L_0x0036;
+    L_0x004f:
+        r2 = 3;
+        r8.mLinkState = r2;	 Catch:{ all -> 0x0044 }
+        r2 = r8.mSendState;	 Catch:{ all -> 0x0044 }
+        if (r2 == r6) goto L_0x0036;
+    L_0x0056:
+        r2 = 200; // 0xc8 float:2.8E-43 double:9.9E-322;
+        r2 = (r0 > r2 ? 1 : (r0 == r2 ? 0 : -1));
+        if (r2 < 0) goto L_0x0060;
+    L_0x005c:
+        r2 = r8.mSendState;	 Catch:{ all -> 0x0044 }
+        if (r2 != r7) goto L_0x0064;
+    L_0x0060:
+        r8.connectLlcpServices();	 Catch:{ all -> 0x0044 }
+        goto L_0x0036;
+    L_0x0064:
+        r2 = 1;
+        r8.mLlcpConnectDelayed = r2;	 Catch:{ all -> 0x0044 }
+        goto L_0x0036;
+        */
+        throw new UnsupportedOperationException("Method not decompiled: com.android.nfc.P2pLinkManager.onLlcpFirstPacketReceived():void");
+    }
+
+    public void onUserSwitched() {
+        synchronized (this) {
+            try {
+                this.mPackageManager = this.mContext.createPackageContextAsUser("android", SNEP_SUCCESS, new UserHandle(ActivityManager.getCurrentUser())).getPackageManager();
+            } catch (NameNotFoundException e) {
+                Log.e(TAG, "Failed to retrieve PackageManager for user");
+            }
+        }
+    }
+
+    void prepareMessageToSend() {
+        synchronized (this) {
+            if (this.mIsSendEnabled) {
+                String runningPackage = null;
+                List<RunningTaskInfo> tasks = this.mActivityManager.getRunningTasks(SNEP_FAILURE);
+                if (tasks.size() > 0) {
+                    runningPackage = ((RunningTaskInfo) tasks.get(SNEP_SUCCESS)).topActivity.getPackageName();
+                }
+                if (runningPackage == null) {
+                    Log.e(TAG, "Could not determine running package.");
+                    this.mMessageToSend = null;
+                    this.mUrisToSend = null;
+                    return;
+                }
+                if (DBG) {
+                    Log.i(TAG, "NFC prepareMessageToSend app is " + runningPackage);
+                }
+                this.mCallbackNdef = (IAppCallback) this.mCallbackNdefs.get(runningPackage);
+                this.mValidCallbackPackages = (String[]) this.mAllValidCallbackPackages.get(runningPackage);
+                if (this.mCallbackNdef != null) {
+                    boolean callbackValid = ECHOSERVER_ENABLED;
+                    if (this.mValidCallbackPackages != null) {
+                        String[] arr$ = this.mValidCallbackPackages;
+                        int len$ = arr$.length;
+                        for (int i$ = SNEP_SUCCESS; i$ < len$; i$ += SNEP_FAILURE) {
+                            if (arr$[i$].equals(runningPackage)) {
+                                callbackValid = true;
+                                break;
+                            }
+                        }
                     }
-                } catch (IOException e) {
-                    result = false;
-                }
-            }
-
-            if (!result && m != null && snepClient != null) {
-                if (DBG) Log.d(TAG, "Sending ndef via SNEP");
-                try {
-                    int snepResult = doSnepProtocol(m);
-                    switch (snepResult) {
-                        case SNEP_SUCCESS:
-                            result = true;
-                            break;
-                        case SNEP_FAILURE:
-                            result = false;
-                            break;
-                        default:
-                            result = false;
+                    if (callbackValid) {
+                        try {
+                            BeamShareData shareData = this.mCallbackNdef.createBeamShareData();
+                            this.mMessageToSend = shareData.ndefMessage;
+                            this.mUrisToSend = shareData.uris;
+                            this.mSendFlags = shareData.flags;
+                            return;
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed NDEF callback: " + e.getMessage());
+                        }
+                    } else if (DBG) {
+                        Log.d(TAG, "Last registered callback is not running in the foreground.");
                     }
-                } catch (IOException e) {
-                    result = false;
                 }
+                if (beamDefaultDisabled(runningPackage) || "android".equals(runningPackage)) {
+                    Log.d(TAG, "Disabling default Beam behavior");
+                    this.mMessageToSend = null;
+                    this.mUrisToSend = null;
+                } else {
+                    this.mMessageToSend = createDefaultNdef(runningPackage);
+                    this.mUrisToSend = null;
+                }
+                if (DBG) {
+                    Log.d(TAG, "mMessageToSend = " + this.mMessageToSend);
+                }
+                if (DBG) {
+                    Log.d(TAG, "mUrisToSend = " + this.mUrisToSend);
+                }
+                return;
             }
+            this.mMessageToSend = null;
+            this.mUrisToSend = null;
+        }
+    }
 
-            if (!result && m != null && nppClient != null) {
-                result = nppClient.push(m);
+    boolean beamDefaultDisabled(String pkgName) {
+        boolean z = ECHOSERVER_ENABLED;
+        try {
+            ApplicationInfo ai = this.mPackageManager.getApplicationInfo(pkgName, HandoverServer.MIU);
+            if (!(ai == null || ai.metaData == null)) {
+                z = ai.metaData.getBoolean(DISABLE_BEAM_DEFAULT);
             }
+        } catch (NameNotFoundException e) {
+        }
+        return z;
+    }
 
-            time = SystemClock.elapsedRealtime() - time;
-            if (DBG) Log.d(TAG, "SendTask result=" + result + ", time ms=" + time);
-            if (result) {
-                onSendComplete(m, time);
+    NdefMessage createDefaultNdef(String pkgName) {
+        NdefRecord appUri = NdefRecord.createUri(Uri.parse("http://play.google.com/store/apps/details?id=" + pkgName + "&feature=beam"));
+        NdefRecord appRecord = NdefRecord.createApplicationRecord(pkgName);
+        NdefRecord[] ndefRecordArr = new NdefRecord[SEND_STATE_NEED_CONFIRMATION];
+        ndefRecordArr[SNEP_SUCCESS] = appUri;
+        ndefRecordArr[SNEP_FAILURE] = appRecord;
+        return new NdefMessage(ndefRecordArr);
+    }
+
+    void disconnectLlcpServices() {
+        synchronized (this) {
+            if (this.mConnectTask != null) {
+                this.mConnectTask.cancel(true);
+                this.mConnectTask = null;
             }
-
-            return null;
+            if (this.mNdefPushClient != null) {
+                this.mNdefPushClient.close();
+                this.mNdefPushClient = null;
+            }
+            if (this.mSnepClient != null) {
+                this.mSnepClient.close();
+                this.mSnepClient = null;
+            }
+            if (this.mHandoverClient != null) {
+                this.mHandoverClient.close();
+                this.mHandoverClient = null;
+            }
+            this.mLlcpServicesConnected = ECHOSERVER_ENABLED;
         }
-    };
+    }
 
+    /* JADX WARNING: inconsistent code. */
+    /* Code decompiled incorrectly, please refer to instructions dump. */
+    public void onLlcpDeactivated() {
+        /*
+        r5 = this;
+        r1 = "NfcP2pLinkManager";
+        r2 = "LLCP deactivated.";
+        android.util.Log.i(r1, r2);
+        monitor-enter(r5);
+        r1 = r5.mEchoServer;	 Catch:{ all -> 0x0020 }
+        if (r1 == 0) goto L_0x0011;
+    L_0x000c:
+        r1 = r5.mEchoServer;	 Catch:{ all -> 0x0020 }
+        r1.onLlcpDeactivated();	 Catch:{ all -> 0x0020 }
+    L_0x0011:
+        r1 = r5.mLinkState;	 Catch:{ all -> 0x0020 }
+        switch(r1) {
+            case 1: goto L_0x0018;
+            case 2: goto L_0x0023;
+            case 3: goto L_0x0023;
+            case 4: goto L_0x0018;
+            default: goto L_0x0016;
+        };	 Catch:{ all -> 0x0020 }
+    L_0x0016:
+        monitor-exit(r5);	 Catch:{ all -> 0x0020 }
+        return;
+    L_0x0018:
+        r1 = "NfcP2pLinkManager";
+        r2 = "Duplicate onLlcpDectivated()";
+        android.util.Log.i(r1, r2);	 Catch:{ all -> 0x0020 }
+        goto L_0x0016;
+    L_0x0020:
+        r1 = move-exception;
+        monitor-exit(r5);	 Catch:{ all -> 0x0020 }
+        throw r1;
+    L_0x0023:
+        r1 = 4;
+        r5.mLinkState = r1;	 Catch:{ all -> 0x0020 }
+        r0 = 0;
+        r1 = r5.mSendState;	 Catch:{ all -> 0x0020 }
+        switch(r1) {
+            case 1: goto L_0x004b;
+            case 2: goto L_0x004d;
+            case 3: goto L_0x0050;
+            case 4: goto L_0x0053;
+            default: goto L_0x002c;
+        };	 Catch:{ all -> 0x0020 }
+    L_0x002c:
+        r1 = r5.mHandler;	 Catch:{ all -> 0x0020 }
+        r2 = 1;
+        r3 = (long) r0;	 Catch:{ all -> 0x0020 }
+        r1.sendEmptyMessageDelayed(r2, r3);	 Catch:{ all -> 0x0020 }
+        r1 = r5.mSendState;	 Catch:{ all -> 0x0020 }
+        r2 = 3;
+        if (r1 != r2) goto L_0x0044;
+    L_0x0038:
+        r1 = "NfcP2pLinkManager";
+        r2 = "onP2pSendDebounce()";
+        android.util.Log.e(r1, r2);	 Catch:{ all -> 0x0020 }
+        r1 = r5.mEventListener;	 Catch:{ all -> 0x0020 }
+        r1.onP2pSendDebounce();	 Catch:{ all -> 0x0020 }
+    L_0x0044:
+        r5.cancelSendNdefMessage();	 Catch:{ all -> 0x0020 }
+        r5.disconnectLlcpServices();	 Catch:{ all -> 0x0020 }
+        goto L_0x0016;
+    L_0x004b:
+        r0 = 0;
+        goto L_0x002c;
+    L_0x004d:
+        r0 = 3000; // 0xbb8 float:4.204E-42 double:1.482E-320;
+        goto L_0x002c;
+    L_0x0050:
+        r0 = 5000; // 0x1388 float:7.006E-42 double:2.4703E-320;
+        goto L_0x002c;
+    L_0x0053:
+        r0 = 250; // 0xfa float:3.5E-43 double:1.235E-321;
+        goto L_0x002c;
+        */
+        throw new UnsupportedOperationException("Method not decompiled: com.android.nfc.P2pLinkManager.onLlcpDeactivated():void");
+    }
 
-    final HandoverServer.Callback mHandoverCallback = new HandoverServer.Callback() {
-        @Override
-        public void onHandoverRequestReceived() {
-            onReceiveHandover();
+    void onHandoverUnsupported() {
+        this.mHandler.sendEmptyMessage(MSG_HANDOVER_NOT_SUPPORTED);
+    }
+
+    void onSendComplete(NdefMessage msg, long elapsedRealtime) {
+        if (this.mFirstBeam) {
+            EventLogTags.writeNfcFirstShare();
+            this.mPrefs.edit().putBoolean("first_beam", ECHOSERVER_ENABLED).apply();
+            this.mFirstBeam = ECHOSERVER_ENABLED;
         }
+        EventLogTags.writeNfcShare(getMessageSize(msg), getMessageTnf(msg), getMessageType(msg), getMessageAarPresent(msg), (int) elapsedRealtime);
+        AuditLog.log(MSG_START_ECHOSERVER, MSG_START_ECHOSERVER, true, Process.myPid(), getClass().getSimpleName(), "Sending data through NFC succeeded");
+        this.mHandler.sendEmptyMessage(SEND_STATE_SEND_COMPLETE);
+    }
 
-        @Override
-        public void onHandoverBusy() {
-            P2pLinkManager.this.onHandoverBusy();
+    void sendNdefMessage() {
+        synchronized (this) {
+            cancelSendNdefMessage();
+            this.mSendTask = new SendTask();
+            this.mSendTask.execute(new Void[SNEP_SUCCESS]);
         }
-    };
+    }
 
-    final NdefPushServer.Callback mNppCallback = new NdefPushServer.Callback() {
-        @Override
-        public void onMessageReceived(NdefMessage msg) {
-            onReceiveComplete(msg);
-        }
-    };
-
-    final SnepServer.Callback mDefaultSnepCallback = new SnepServer.Callback() {
-        @Override
-        public SnepMessage doPut(NdefMessage msg) {
-            onReceiveComplete(msg);
-            return SnepMessage.getMessage(SnepMessage.RESPONSE_SUCCESS);
-        }
-
-        @Override
-        public SnepMessage doGet(int acceptableLength, NdefMessage msg) {
-            // The NFC Forum Default SNEP server is not allowed to respond to
-            // SNEP GET requests - see SNEP 1.0 TS section 6.1. However,
-            // since Android 4.1 used the NFC Forum default server to
-            // implement connection handover, we will support this
-            // until we can deprecate it.
-            NdefMessage response = mHandoverDataParser.getIncomingHandoverData(msg).handoverSelect;
-            if (response != null) {
-                onReceiveHandover();
-                return SnepMessage.getSuccessResponse(response);
-            } else {
-                return SnepMessage.getMessage(SnepMessage.RESPONSE_NOT_IMPLEMENTED);
+    void cancelSendNdefMessage() {
+        synchronized (this) {
+            if (this.mSendTask != null) {
+                this.mSendTask.cancel(true);
             }
         }
-    };
+    }
+
+    void connectLlcpServices() {
+        synchronized (this) {
+            if (this.mConnectTask != null) {
+                Log.e(TAG, "Still had a reference to mConnectTask!");
+            }
+            this.mConnectTask = new ConnectTask();
+            this.mConnectTask.execute(new Void[SNEP_SUCCESS]);
+        }
+    }
+
+    void onLlcpServicesConnected() {
+        if (DBG) {
+            Log.d(TAG, "onLlcpServicesConnected");
+        }
+        synchronized (this) {
+            if (this.mLinkState != SEND_STATE_SENDING) {
+                return;
+            }
+            this.mLlcpServicesConnected = true;
+            if (this.mSendState == SEND_STATE_SENDING) {
+                this.mEventListener.onP2pResumeSend();
+                sendNdefMessage();
+            }
+        }
+    }
 
     void onReceiveHandover() {
-        mHandler.obtainMessage(MSG_RECEIVE_HANDOVER).sendToTarget();
+        this.mHandler.obtainMessage(SEND_STATE_SENDING).sendToTarget();
     }
 
     void onReceiveComplete(NdefMessage msg) {
-        // Make callbacks on UI thread
-        mHandler.obtainMessage(MSG_RECEIVE_COMPLETE, msg).sendToTarget();
+        EventLogTags.writeNfcNdefReceived(getMessageSize(msg), getMessageTnf(msg), getMessageType(msg), getMessageAarPresent(msg));
+        AuditLog.log(MSG_START_ECHOSERVER, MSG_START_ECHOSERVER, true, Process.myPid(), getClass().getSimpleName(), "Receiving data through NFC succeeded");
+        this.mHandler.obtainMessage(SEND_STATE_NEED_CONFIRMATION, msg).sendToTarget();
     }
 
-    @Override
     public boolean handleMessage(Message msg) {
         switch (msg.what) {
-            case MSG_START_ECHOSERVER:
+            case SNEP_FAILURE /*1*/:
                 synchronized (this) {
-                    mEchoServer.start();
-                    break;
-                }
-            case MSG_STOP_ECHOSERVER:
-                synchronized (this) {
-                    mEchoServer.stop();
-                    break;
-                }
-            case MSG_WAIT_FOR_LINK_TIMEOUT:
-                synchronized (this) {
-                    // User wanted to send something but no link
-                    // came up. Just cancel the send
-                    mSendState = SEND_STATE_NOTHING_TO_SEND;
-                    mEventListener.onP2pTimeoutWaitingForLink();
-                }
-                break;
-            case MSG_DEBOUNCE_TIMEOUT:
-                synchronized (this) {
-                    if (mLinkState != LINK_STATE_DEBOUNCE) {
-                        break;
-                    }
-                    if (DBG) Log.d(TAG, "Debounce timeout");
-                    mLinkState = LINK_STATE_DOWN;
-                    mSendState = SEND_STATE_NOTHING_TO_SEND;
-                    mMessageToSend = null;
-                    mUrisToSend = null;
-                    if (DBG) Log.d(TAG, "onP2pOutOfRange()");
-                    mEventListener.onP2pOutOfRange();
-                }
-                break;
-            case MSG_RECEIVE_HANDOVER:
-                // We're going to do a handover request
-                synchronized (this) {
-                    if (mLinkState == LINK_STATE_DOWN) {
-                        break;
-                    }
-                    if (mSendState == SEND_STATE_SENDING) {
-                        cancelSendNdefMessage();
-                    }
-                    mSendState = SEND_STATE_NOTHING_TO_SEND;
-                    if (DBG) Log.d(TAG, "onP2pReceiveComplete()");
-                    mEventListener.onP2pReceiveComplete(false);
-                }
-                break;
-            case MSG_RECEIVE_COMPLETE:
-                NdefMessage m = (NdefMessage) msg.obj;
-                synchronized (this) {
-                    if (mLinkState == LINK_STATE_DOWN) {
-                        break;
-                    }
-                    if (mSendState == SEND_STATE_SENDING) {
-                        cancelSendNdefMessage();
-                    }
-                    mSendState = SEND_STATE_NOTHING_TO_SEND;
-                    if (DBG) Log.d(TAG, "onP2pReceiveComplete()");
-                    mEventListener.onP2pReceiveComplete(true);
-                    NfcService.getInstance().sendMockNdefTag(m);
-                }
-                break;
-            case MSG_HANDOVER_NOT_SUPPORTED:
-                synchronized (P2pLinkManager.this) {
-                    mSendTask = null;
-
-                    if (mLinkState == LINK_STATE_DOWN || mSendState != SEND_STATE_SENDING) {
-                        break;
-                    }
-                    mSendState = SEND_STATE_NOTHING_TO_SEND;
-                    if (DBG) Log.d(TAG, "onP2pHandoverNotSupported()");
-                    mEventListener.onP2pHandoverNotSupported();
-                }
-                break;
-            case MSG_SEND_COMPLETE:
-                synchronized (P2pLinkManager.this) {
-                    mSendTask = null;
-
-                    if (mLinkState == LINK_STATE_DOWN || mSendState != SEND_STATE_SENDING) {
-                        break;
-                    }
-                    mSendState = SEND_STATE_COMPLETE;
-                    mHandler.removeMessages(MSG_DEBOUNCE_TIMEOUT);
-                    if (DBG) Log.d(TAG, "onP2pSendComplete()");
-                    mEventListener.onP2pSendComplete();
-                    if (mCallbackNdef != null) {
-                        try {
-                            mCallbackNdef.onNdefPushComplete(mPeerLlcpVersion);
-                        } catch (Exception e) {
-                            Log.e(TAG, "Failed NDEF completed callback: " + e.getMessage());
+                    if (this.mLinkState == SEND_STATE_SEND_COMPLETE) {
+                        if (this.mSendState == SEND_STATE_SENDING) {
+                            AuditLog.log(MSG_START_ECHOSERVER, MSG_START_ECHOSERVER, ECHOSERVER_ENABLED, Process.myPid(), getClass().getSimpleName(), "Sending data through NFC failed");
+                            EventLogTags.writeNfcShareFail(getMessageSize(this.mMessageToSend), getMessageTnf(this.mMessageToSend), getMessageType(this.mMessageToSend), getMessageAarPresent(this.mMessageToSend));
                         }
-                    }
-                }
-                break;
-            case MSG_HANDOVER_BUSY:
-                synchronized (P2pLinkManager.this) {
-                    mSendTask = null;
-
-                    if (mLinkState == LINK_STATE_DOWN || mSendState != SEND_STATE_SENDING) {
+                        if (DBG) {
+                            Log.d(TAG, "Debounce timeout");
+                        }
+                        this.mLinkState = SNEP_FAILURE;
+                        this.mSendState = SNEP_FAILURE;
+                        this.mMessageToSend = null;
+                        this.mUrisToSend = null;
+                        if (DBG) {
+                            Log.d(TAG, "onP2pOutOfRange()");
+                        }
+                        this.mEventListener.onP2pOutOfRange();
+                        if (NfcService.mIsSecNdefEnabled) {
+                            this.mSecNdefService.onP2pOutOfRange();
+                        }
                         break;
                     }
-                    mSendState = SEND_STATE_NOTHING_TO_SEND;
-                    if (DBG) Log.d(TAG, "onP2pHandoverBusy()");
-                    mEventListener.onP2pHandoverBusy();
+                    break;
+                    break;
                 }
+            case SEND_STATE_NEED_CONFIRMATION /*2*/:
+                NdefMessage m = msg.obj;
+                synchronized (this) {
+                    if (this.mLinkState != SNEP_FAILURE) {
+                        if (this.mSendState == SEND_STATE_SENDING) {
+                            cancelSendNdefMessage();
+                        }
+                        this.mSendState = SNEP_FAILURE;
+                        if (DBG) {
+                            Log.d(TAG, "onP2pReceiveComplete()");
+                        }
+                        this.mEventListener.onP2pReceiveComplete(true);
+                        NfcService.getInstance().sendMockNdefTag(m);
+                        break;
+                    }
+                    break;
+                    break;
+                }
+            case SEND_STATE_SENDING /*3*/:
+                synchronized (this) {
+                    if (this.mLinkState != SNEP_FAILURE) {
+                        if (this.mSendState == SEND_STATE_SENDING) {
+                            cancelSendNdefMessage();
+                        }
+                        this.mSendState = SNEP_FAILURE;
+                        if (DBG) {
+                            Log.d(TAG, "onP2pReceiveComplete()");
+                        }
+                        this.mEventListener.onP2pReceiveComplete(ECHOSERVER_ENABLED);
+                        break;
+                    }
+                    break;
+                    break;
+                }
+            case SEND_STATE_SEND_COMPLETE /*4*/:
+                synchronized (this) {
+                    this.mSendTask = null;
+                    if (this.mLinkState != SNEP_FAILURE && this.mSendState == SEND_STATE_SENDING) {
+                        this.mSendState = SEND_STATE_SEND_COMPLETE;
+                        this.mHandler.removeMessages(SNEP_FAILURE);
+                        if (DBG) {
+                            Log.d(TAG, "onP2pSendComplete()");
+                        }
+                        this.mEventListener.onP2pSendComplete();
+                        if (this.mCallbackNdef != null) {
+                            try {
+                                this.mCallbackNdef.onNdefPushComplete();
+                                break;
+                            } catch (Exception e) {
+                                Log.e(TAG, "Failed NDEF completed callback: " + e.getMessage());
+                            }
+                        }
+                        break;
+                    }
+                    if (DBG) {
+                        Log.d(TAG, "Send complete succefully, but state is chagned");
+                    }
+                    String ACTION_P2P_SEND_COMPLETE = "android.nfc.action.P2P_SEND_COMPLETE";
+                    Intent SbeamIntent = new Intent("android.nfc.action.P2P_SEND_COMPLETE");
+                    SbeamIntent.setPackage("com.sec.android.directshare");
+                    this.mContext.sendBroadcast(SbeamIntent);
+                    if (DBG) {
+                        Log.d(TAG, "send p2p send complete intent to directshare");
+                    }
+                    Intent ShareShotIntent = new Intent("android.nfc.action.P2P_SEND_COMPLETE");
+                    ShareShotIntent.setPackage("com.sec.android.directconnect");
+                    this.mContext.sendBroadcast(ShareShotIntent);
+                    if (DBG) {
+                        Log.d(TAG, "send p2p send complete intent to directconnect");
+                    }
+                    break;
+                    break;
+                }
+            case MSG_START_ECHOSERVER /*5*/:
+                synchronized (this) {
+                    this.mEchoServer.start();
+                    break;
+                }
+                break;
+            case MSG_STOP_ECHOSERVER /*6*/:
+                synchronized (this) {
+                    this.mEchoServer.stop();
+                    break;
+                }
+                break;
+            case MSG_HANDOVER_NOT_SUPPORTED /*7*/:
+                synchronized (this) {
+                    this.mSendTask = null;
+                    if (this.mLinkState != SNEP_FAILURE && this.mSendState == SEND_STATE_SENDING) {
+                        this.mSendState = SNEP_FAILURE;
+                        if (DBG) {
+                            Log.d(TAG, "onP2pHandoverNotSupported()");
+                        }
+                        this.mEventListener.onP2pHandoverNotSupported();
+                        break;
+                    }
+                    break;
+                    break;
+                }
+            case MSG_SEC_SEND_MSG /*9*/:
+                NdefMessage nm = msg.obj;
+                synchronized (this) {
+                    if (!this.mIsSendEnabled || this.mLinkState != SEND_STATE_NEED_CONFIRMATION || this.mSendState != SNEP_FAILURE) {
+                        if (DBG) {
+                            Log.d(TAG, "mLinkState=" + linkStateToString(this.mLinkState));
+                        }
+                        if (DBG) {
+                            Log.d(TAG, "mSendState=" + sendStateToString(this.mSendState));
+                        }
+                        break;
+                    }
+                    this.mMessageToSend = nm;
+                    this.mSendState = SEND_STATE_NEED_CONFIRMATION;
+                    if (DBG) {
+                        Log.d(TAG, "onP2pSendConfirmationRequested()");
+                    }
+                    this.mEventListener.onP2pSendConfirmationRequested();
+                    break;
+                }
+                break;
         }
         return true;
     }
 
+    int getMessageSize(NdefMessage msg) {
+        if (msg != null) {
+            return msg.toByteArray().length;
+        }
+        return SNEP_SUCCESS;
+    }
 
-    @Override
+    int getMessageTnf(NdefMessage msg) {
+        if (msg == null) {
+            return SNEP_SUCCESS;
+        }
+        NdefRecord[] records = msg.getRecords();
+        if (records == null || records.length == 0) {
+            return SNEP_SUCCESS;
+        }
+        return records[SNEP_SUCCESS].getTnf();
+    }
+
+    String getMessageType(NdefMessage msg) {
+        if (msg == null) {
+            return "null";
+        }
+        NdefRecord[] records = msg.getRecords();
+        if (records == null || records.length == 0) {
+            return "null";
+        }
+        NdefRecord record = records[SNEP_SUCCESS];
+        switch (record.getTnf()) {
+            case SNEP_FAILURE /*1*/:
+            case SEND_STATE_NEED_CONFIRMATION /*2*/:
+            case SEND_STATE_SEND_COMPLETE /*4*/:
+                return new String(record.getType(), StandardCharsets.UTF_8);
+            case SEND_STATE_SENDING /*3*/:
+                return "uri";
+            default:
+                return "unknown";
+        }
+    }
+
+    int getMessageAarPresent(NdefMessage msg) {
+        if (msg == null) {
+            return SNEP_SUCCESS;
+        }
+        NdefRecord[] records = msg.getRecords();
+        if (records == null) {
+            return SNEP_SUCCESS;
+        }
+        NdefRecord[] arr$ = records;
+        int len$ = arr$.length;
+        for (int i$ = SNEP_SUCCESS; i$ < len$; i$ += SNEP_FAILURE) {
+            NdefRecord record = arr$[i$];
+            if (record.getTnf() == (short) 4 && Arrays.equals(NdefRecord.RTD_ANDROID_APP, record.getType())) {
+                return SNEP_FAILURE;
+            }
+        }
+        return SNEP_SUCCESS;
+    }
+
     public void onP2pSendConfirmed() {
         onP2pSendConfirmed(true);
     }
 
     private void onP2pSendConfirmed(boolean requireConfirmation) {
-        if (DBG) Log.d(TAG, "onP2pSendConfirmed()");
+        if (DBG) {
+            Log.d(TAG, "onP2pSendConfirmed()");
+        }
         synchronized (this) {
-            if (mLinkState == LINK_STATE_DOWN || (requireConfirmation
-                    && mSendState != SEND_STATE_NEED_CONFIRMATION)) {
+            if (this.mLinkState == SNEP_FAILURE || (requireConfirmation && this.mSendState != SEND_STATE_NEED_CONFIRMATION)) {
                 return;
             }
-            mSendState = SEND_STATE_SENDING;
-            if (mLinkState == LINK_STATE_UP) {
-                if (mLlcpServicesConnected) {
-                    sendNdefMessage();
-                } // else, will send messages when link comes up
-            } else if (mLinkState == LINK_STATE_DEBOUNCE) {
-                // Restart debounce timeout and tell user to tap again
-                scheduleTimeoutLocked(MSG_DEBOUNCE_TIMEOUT, LINK_SEND_CONFIRMED_DEBOUNCE_MS);
-                mEventListener.onP2pSendDebounce();
+            this.mSendState = SEND_STATE_SENDING;
+            if (this.mLinkState == SEND_STATE_NEED_CONFIRMATION) {
+                this.mLinkState = SEND_STATE_SENDING;
+                connectLlcpServices();
+            } else if (this.mLinkState == SEND_STATE_SENDING && this.mLlcpServicesConnected) {
+                sendNdefMessage();
+            } else if (this.mLinkState == SEND_STATE_SENDING && this.mLlcpConnectDelayed) {
+                connectLlcpServices();
+            } else if (this.mLinkState == SEND_STATE_SEND_COMPLETE) {
+                this.mHandler.removeMessages(SNEP_FAILURE);
+                this.mHandler.sendEmptyMessageDelayed(SNEP_FAILURE, 5000);
+                this.mEventListener.onP2pSendDebounce();
             }
         }
-    }
-
-
-    @Override
-    public void onP2pCanceled() {
-        synchronized (this) {
-            mSendState = SEND_STATE_CANCELED;
-            if (mLinkState == LINK_STATE_DOWN) {
-                // If we were waiting for the link to come up, stop doing so
-                mHandler.removeMessages(MSG_WAIT_FOR_LINK_TIMEOUT);
-            } else if (mLinkState == LINK_STATE_DEBOUNCE) {
-                // We're in debounce state so link is down. Reschedule debounce
-                // timeout to occur sooner, we don't want to wait any longer.
-                scheduleTimeoutLocked(MSG_DEBOUNCE_TIMEOUT, LINK_SEND_CANCELED_DEBOUNCE_MS);
-            } else {
-                // Link is up, nothing else to do but wait for link to go down
-            }
-        }
-    }
-
-    void scheduleTimeoutLocked(int what, int timeout) {
-        // Cancel any outstanding debounce timeouts.
-        mHandler.removeMessages(what);
-        mHandler.sendEmptyMessageDelayed(what, timeout);
     }
 
     static String sendStateToString(int state) {
         switch (state) {
-            case SEND_STATE_NOTHING_TO_SEND:
+            case SNEP_FAILURE /*1*/:
                 return "SEND_STATE_NOTHING_TO_SEND";
-            case SEND_STATE_NEED_CONFIRMATION:
+            case SEND_STATE_NEED_CONFIRMATION /*2*/:
                 return "SEND_STATE_NEED_CONFIRMATION";
-            case SEND_STATE_SENDING:
+            case SEND_STATE_SENDING /*3*/:
                 return "SEND_STATE_SENDING";
-            case SEND_STATE_COMPLETE:
-                return "SEND_STATE_COMPLETE";
-            case SEND_STATE_CANCELED:
-                return "SEND_STATE_CANCELED";
             default:
                 return "<error>";
         }
@@ -1098,12 +1253,14 @@ class P2pLinkManager implements Handler.Callback, P2pEventListener.Callback {
 
     static String linkStateToString(int state) {
         switch (state) {
-            case LINK_STATE_DOWN:
+            case SNEP_FAILURE /*1*/:
                 return "LINK_STATE_DOWN";
-            case LINK_STATE_DEBOUNCE:
-                return "LINK_STATE_DEBOUNCE";
-            case LINK_STATE_UP:
+            case SEND_STATE_NEED_CONFIRMATION /*2*/:
+                return "LINK_STATE_WAITING_PDU";
+            case SEND_STATE_SENDING /*3*/:
                 return "LINK_STATE_UP";
+            case SEND_STATE_SEND_COMPLETE /*4*/:
+                return "LINK_STATE_DEBOUNCE";
             default:
                 return "<error>";
         }
@@ -1111,14 +1268,46 @@ class P2pLinkManager implements Handler.Callback, P2pEventListener.Callback {
 
     void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
         synchronized (this) {
-            pw.println("mIsSendEnabled=" + mIsSendEnabled);
-            pw.println("mIsReceiveEnabled=" + mIsReceiveEnabled);
-            pw.println("mLinkState=" + linkStateToString(mLinkState));
-            pw.println("mSendState=" + sendStateToString(mSendState));
-
-            pw.println("mCallbackNdef=" + mCallbackNdef);
-            pw.println("mMessageToSend=" + mMessageToSend);
-            pw.println("mUrisToSend=" + mUrisToSend);
+            pw.println("mIsSendEnabled=" + this.mIsSendEnabled);
+            pw.println("mIsReceiveEnabled=" + this.mIsReceiveEnabled);
+            pw.println("mLinkState=" + linkStateToString(this.mLinkState));
+            pw.println("mSendState=" + sendStateToString(this.mSendState));
+            pw.println("mCallbackNdef=" + this.mCallbackNdef);
+            pw.println("mMessageToSend=" + this.mMessageToSend);
+            pw.println("mUrisToSend=" + this.mUrisToSend);
         }
+    }
+
+    public int createSecNdefService(String serviceName, int serverSap, String pkgName, byte[] type, byte[] id) throws Exception {
+        if (!NfcService.mIsSecNdefEnabled) {
+            return -1;
+        }
+        try {
+            return this.mSecNdefService.createSecNdefService(serviceName, serverSap, pkgName, type, id);
+        } catch (Exception e) {
+            throw e;
+        }
+    }
+
+    public int secSendNdefMsg(int SAP, NdefMessage msg) {
+        if (NfcService.mIsSecNdefEnabled) {
+            return this.mSecNdefService.secSendNdefMsg(SAP, msg);
+        }
+        return -1;
+    }
+
+    public int closeSecNdefService(int SAP) {
+        if (NfcService.mIsSecNdefEnabled && this.mSecNdefService != null && this.mSecNdefService.closeSecNdefService(SAP)) {
+            return SNEP_SUCCESS;
+        }
+        return -1;
+    }
+
+    public int secSendAbeamNdefMsg(NdefMessage msg) {
+        if (!NfcService.mIsSecNdefEnabled) {
+            return -1;
+        }
+        this.mHandler.obtainMessage(MSG_SEC_SEND_MSG, msg).sendToTarget();
+        return SNEP_SUCCESS;
     }
 }

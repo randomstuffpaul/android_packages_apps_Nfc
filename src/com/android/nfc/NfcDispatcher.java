@@ -1,458 +1,475 @@
-/*
- * Copyright (C) 2011 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.android.nfc;
 
-import android.app.ActivityManager;
-import android.bluetooth.BluetoothAdapter;
-import android.os.UserManager;
-
-import com.android.nfc.RegisteredComponentCache.ComponentInfo;
-import com.android.nfc.handover.HandoverDataParser;
-import com.android.nfc.handover.PeripheralHandoverService;
-
-import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.ActivityManagerNative;
 import android.app.IActivityManager;
 import android.app.PendingIntent;
 import android.app.PendingIntent.CanceledException;
+import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences.Editor;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.ResolveInfo;
 import android.content.res.Resources.NotFoundException;
 import android.net.Uri;
+import android.net.Uri.Builder;
+import android.nfc.FormatException;
 import android.nfc.NdefMessage;
 import android.nfc.NdefRecord;
-import android.nfc.NfcAdapter;
 import android.nfc.Tag;
 import android.nfc.tech.Ndef;
-import android.nfc.tech.NfcBarcode;
+import android.nfc.tech.NfcA;
+import android.os.PatternMatcher;
 import android.os.RemoteException;
 import android.os.UserHandle;
 import android.util.Log;
-
+import android.widget.Toast;
+import com.android.nfc.RegisteredComponentCache.ComponentInfo;
+import com.android.nfc.handover.HandoverManager;
+import com.gsma.services.nfc.NfcController;
+import com.sec.android.app.CscFeature;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.FileDescriptor;
+import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 
-/**
- * Dispatch of NFC events to start activities
- */
-class NfcDispatcher {
-    private static final boolean DBG = false;
-    private static final String TAG = "NfcDispatcher";
+public class NfcDispatcher {
+    static final boolean DBG;
+    static final String HOMESYNC_PACKAGE_NAME = "com.sec.android.homesync";
+    static final String REG_EXPRESS_PHONE_NUMBER = "^([0-9]|[*#(/)N,.;+-])+$";
+    static final String TAG = "NfcDispatcher";
+    static final String TYPE_NAME_SEC_OOB = "application/vnd.sec.oob.";
+    static final String VALID_PHONE_NUMBER = "0123456789*#(/)N,.;+-";
+    final String ACTION_TRANSACTION_DETECTED;
+    final String EXTRA_DATA;
+    final String NFC_PERM;
+    final ContentResolver mContentResolver;
+    final Context mContext;
+    final HandoverManager mHandoverManager;
+    final IActivityManager mIActivityManager;
+    IntentFilter[] mOverrideFilters;
+    PendingIntent mOverrideIntent;
+    String[][] mOverrideTechLists;
+    final String[] mProvisioningMimes;
+    boolean mProvisioningOnly;
+    final RegisteredComponentCache mTechListFilters;
+    Toast mToast;
 
-    static final int DISPATCH_SUCCESS = 1;
-    static final int DISPATCH_FAIL = 2;
-    static final int DISPATCH_UNLOCK = 3;
+    static class DispatchInfo {
+        final Context context;
+        public final Intent intent;
+        final String ndefMimeType;
+        final Uri ndefUri;
+        final PackageManager packageManager;
+        final Intent rootIntent;
 
-    private final Context mContext;
-    private final IActivityManager mIActivityManager;
-    private final RegisteredComponentCache mTechListFilters;
-    private final ContentResolver mContentResolver;
-    private final HandoverDataParser mHandoverDataParser;
-    private final String[] mProvisioningMimes;
-    private final ScreenStateHelper mScreenStateHelper;
-    private final NfcUnlockManager mNfcUnlockManager;
-    private final boolean mDeviceSupportsBluetooth;
+        public DispatchInfo(Context context, Tag tag, NdefMessage message) {
+            this.intent = new Intent();
+            this.intent.putExtra("android.nfc.extra.TAG", tag);
+            this.intent.putExtra("android.nfc.extra.ID", tag.getId());
+            if (message != null) {
+                this.intent.putExtra("android.nfc.extra.NDEF_MESSAGES", new NdefMessage[]{message});
+                this.ndefUri = message.getRecords()[0].toUri();
+                this.ndefMimeType = message.getRecords()[0].toMimeType();
+            } else {
+                this.ndefUri = null;
+                this.ndefMimeType = null;
+            }
+            this.rootIntent = new Intent(context, NfcRootActivity.class);
+            this.rootIntent.putExtra("launchIntent", this.intent);
+            this.rootIntent.setFlags(268468224);
+            this.rootIntent.putExtra(NfcRootActivity.EXTRA_INVALID_TAG, NfcDispatcher.DBG);
+            this.context = context;
+            this.packageManager = context.getPackageManager();
+        }
 
-    // Locked on this
-    private PendingIntent mOverrideIntent;
-    private IntentFilter[] mOverrideFilters;
-    private String[][] mOverrideTechLists;
-    private boolean mProvisioningOnly;
+        public Intent setNdefIntent() {
+            this.intent.setAction("android.nfc.action.NDEF_DISCOVERED");
+            if (this.ndefUri != null) {
+                this.intent.setData(this.ndefUri);
+                return this.intent;
+            } else if (this.ndefMimeType == null) {
+                return null;
+            } else {
+                this.intent.setType(this.ndefMimeType);
+                return this.intent;
+            }
+        }
 
-    NfcDispatcher(Context context,
-                  HandoverDataParser handoverDataParser,
-                  boolean provisionOnly) {
-        mContext = context;
-        mIActivityManager = ActivityManagerNative.getDefault();
-        mTechListFilters = new RegisteredComponentCache(mContext,
-                NfcAdapter.ACTION_TECH_DISCOVERED, NfcAdapter.ACTION_TECH_DISCOVERED);
-        mContentResolver = context.getContentResolver();
-        mHandoverDataParser = handoverDataParser;
-        mScreenStateHelper = new ScreenStateHelper(context);
-        mNfcUnlockManager = NfcUnlockManager.getInstance();
-        mDeviceSupportsBluetooth = BluetoothAdapter.getDefaultAdapter() != null;
+        public Intent setTechIntent() {
+            this.intent.setData(null);
+            this.intent.setType(null);
+            this.intent.setAction("android.nfc.action.TECH_DISCOVERED");
+            return this.intent;
+        }
 
+        public Intent setTagIntent() {
+            this.intent.setData(null);
+            this.intent.setType(null);
+            this.intent.setAction("android.nfc.action.TAG_DISCOVERED");
+            return this.intent;
+        }
+
+        boolean tryStartActivity() {
+            if (this.packageManager.queryIntentActivitiesAsUser(this.intent, 0, ActivityManager.getCurrentUser()).size() <= 0) {
+                return NfcDispatcher.DBG;
+            }
+            Log.d(NfcDispatcher.TAG, "tryStartActivity. Send intent.");
+            this.context.startActivityAsUser(this.rootIntent, UserHandle.CURRENT);
+            return true;
+        }
+
+        boolean tryStartActivity(String packagename) {
+            Intent startintetnt = new Intent("android.intent.action.MAIN");
+            startintetnt.setPackage(packagename);
+            ResolveInfo activities = this.packageManager.resolveActivityAsUser(startintetnt, 0, ActivityManager.getCurrentUser());
+            if (activities == null) {
+                return NfcDispatcher.DBG;
+            }
+            Intent intent = new Intent(startintetnt);
+            intent.setClassName(activities.activityInfo.applicationInfo.packageName, activities.activityInfo.name);
+            this.context.startActivityAsUser(intent, UserHandle.CURRENT);
+            return true;
+        }
+
+        boolean tryStartActivity(Intent intentToStart) {
+            if (this.packageManager.queryIntentActivitiesAsUser(intentToStart, 0, ActivityManager.getCurrentUser()).size() <= 0) {
+                return NfcDispatcher.DBG;
+            }
+            this.rootIntent.putExtra("launchIntent", intentToStart);
+            this.context.startActivityAsUser(this.rootIntent, UserHandle.CURRENT);
+            return true;
+        }
+    }
+
+    static {
+        DBG = NfcService.DBG;
+    }
+
+    public NfcDispatcher(Context context, HandoverManager handoverManager, boolean provisionOnly) {
+        this.ACTION_TRANSACTION_DETECTED = "com.sony.nfc.action.TRANSACTION_DETECTED";
+        this.EXTRA_DATA = "com.sony.extra.DATA";
+        this.NFC_PERM = NfcController.NFC_CONTROLLER_PERMISSION;
+        this.mToast = null;
+        this.mContext = context;
+        this.mIActivityManager = ActivityManagerNative.getDefault();
+        this.mTechListFilters = new RegisteredComponentCache(this.mContext, "android.nfc.action.TECH_DISCOVERED", "android.nfc.action.TECH_DISCOVERED");
+        this.mContentResolver = context.getContentResolver();
+        this.mHandoverManager = handoverManager;
         synchronized (this) {
-            mProvisioningOnly = provisionOnly;
+            this.mProvisioningOnly = provisionOnly;
         }
         String[] provisionMimes = null;
         if (provisionOnly) {
             try {
-                // Get accepted mime-types
-                provisionMimes = context.getResources().
-                        getStringArray(R.array.provisioning_mime_types);
+                provisionMimes = context.getResources().getStringArray(C0027R.array.provisioning_mime_types);
             } catch (NotFoundException e) {
-               provisionMimes = null;
+                provisionMimes = null;
             }
         }
-        mProvisioningMimes = provisionMimes;
+        this.mProvisioningMimes = provisionMimes;
     }
 
-    public synchronized void setForegroundDispatch(PendingIntent intent,
-            IntentFilter[] filters, String[][] techLists) {
-        if (DBG) Log.d(TAG, "Set Foreground Dispatch");
-        mOverrideIntent = intent;
-        mOverrideFilters = filters;
-        mOverrideTechLists = techLists;
+    public synchronized void setForegroundDispatch(PendingIntent intent, IntentFilter[] filters, String[][] techLists) {
+        if (DBG) {
+            Log.d(TAG, "Set Foreground Dispatch");
+        }
+        this.mOverrideIntent = intent;
+        this.mOverrideFilters = filters;
+        this.mOverrideTechLists = techLists;
     }
 
     public synchronized void disableProvisioningMode() {
-       mProvisioningOnly = false;
+        this.mProvisioningOnly = DBG;
     }
 
-    /**
-     * Helper for re-used objects and methods during a single tag dispatch.
-     */
-    static class DispatchInfo {
-        public final Intent intent;
+    public boolean handleInputValidatioin(DispatchInfo dispatch, NdefMessage msg) {
+        if (!CscFeature.getInstance().getEnableStatus("CscFeature_NFC_EnableInvalidTagPopup")) {
+            return DBG;
+        }
+        if (msg == null) {
+            return DBG;
+        }
+        short tnf = msg.getRecords()[0].getTnf();
+        byte[] type = msg.getRecords()[0].getType();
+        boolean checkValidation = DBG;
+        int prefix = -1;
+        if (tnf == (short) 1) {
+            if (Arrays.equals(type, NdefRecord.RTD_URI)) {
+                prefix = msg.getRecords()[0].getPayload()[0] & -1;
+                checkValidation = true;
+            } else if (Arrays.equals(type, NdefRecord.RTD_SMART_POSTER)) {
+                try {
+                    for (NdefRecord nestedRecord : new NdefMessage(msg.getRecords()[0].getPayload()).getRecords()) {
+                        if (nestedRecord.getTnf() == (short) 1 && Arrays.equals(nestedRecord.getType(), NdefRecord.RTD_URI)) {
+                            prefix = nestedRecord.getPayload()[0] & -1;
+                            checkValidation = true;
+                            break;
+                        }
+                    }
+                } catch (FormatException e) {
+                    checkValidation = DBG;
+                } catch (NullPointerException e2) {
+                    checkValidation = DBG;
+                }
+            }
+        }
+        if (checkValidation) {
+            if (prefix < 0 || prefix > 35) {
+                Log.d(TAG, "Invalid Uri Tag");
+                dispatch.rootIntent.putExtra(NfcRootActivity.EXTRA_INVALID_TAG, true);
+                return true;
+            } else if (prefix == 5 && dispatch.ndefUri != null) {
+                String telUri = dispatch.ndefUri.toString();
+                String phoneNumber = telUri.substring(4, telUri.length());
+                for (int i = 0; i < phoneNumber.length(); i++) {
+                    if (VALID_PHONE_NUMBER.indexOf(phoneNumber.substring(i, i + 1)) == -1) {
+                        Log.d(TAG, "Invalid phone number tag");
+                        dispatch.rootIntent.putExtra(NfcRootActivity.EXTRA_INVALID_TAG, true);
+                        this.mContext.startActivityAsUser(dispatch.rootIntent, UserHandle.CURRENT);
+                        return true;
+                    }
+                }
+            }
+        }
+        return DBG;
+    }
 
-        final Intent rootIntent;
-        final Uri ndefUri;
-        final String ndefMimeType;
-        final PackageManager packageManager;
-        final Context context;
+    public boolean handleSecurityPopup(DispatchInfo dispatch, NdefMessage msg) {
+        String popup = CscFeature.getInstance().getString("CscFeature_NFC_EnableSecurityPromptPopup");
+        if (popup == null || popup.length() == 0) {
+            return DBG;
+        }
+        if (msg == null) {
+            return DBG;
+        }
+        if (popup.toLowerCase().contains("all") || popup.toLowerCase().contains("contact")) {
+            NdefRecord record = msg.getRecords()[0];
+            byte[] payload = record.getPayload();
+            String type = new String(record.getType(), Charset.forName("UTF8"));
+            if ("text/x-vcard".equalsIgnoreCase(type) || "text/vcard".equals(type)) {
+                String endLine = "";
+                try {
+                    BufferedReader mReader = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(payload), Charset.forName("UTF8")));
+                    String line = mReader.readLine();
+                    if (line == null || !line.trim().equalsIgnoreCase("BEGIN:VCARD")) {
+                        if (DBG) {
+                            Log.d(TAG, "Not found BEGIN:VCARD at first line");
+                        }
+                        dispatch.rootIntent.putExtra(NfcRootActivity.EXTRA_INVALID_TAG, true);
+                        this.mContext.startActivityAsUser(dispatch.rootIntent, UserHandle.CURRENT);
+                        return true;
+                    }
+                    dispatch.intent.putExtra("mFNname", "");
+                    for (line = mReader.readLine(); line != null; line = mReader.readLine()) {
+                        String[] strArray = line.split(":", 2);
+                        if (strArray[0].trim().contains("TEL")) {
+                            dispatch.intent.putExtra("mFNname", strArray[1]);
+                            if (DBG) {
+                                Log.d(TAG, "phoneNumber : " + strArray[1]);
+                            }
+                        }
+                        endLine = line;
+                    }
+                    if (!endLine.trim().equalsIgnoreCase("END:VCARD")) {
+                        if (DBG) {
+                            Log.d(TAG, "Not found END:VCARD at last line");
+                        }
+                        dispatch.rootIntent.putExtra(NfcRootActivity.EXTRA_INVALID_TAG, true);
+                        this.mContext.startActivityAsUser(dispatch.rootIntent, UserHandle.CURRENT);
+                        return true;
+                    }
+                } catch (IOException e) {
+                }
+            }
+        }
+        return DBG;
+    }
 
-        public DispatchInfo(Context context, Tag tag, NdefMessage message) {
-            intent = new Intent();
-            intent.putExtra(NfcAdapter.EXTRA_TAG, tag);
-            intent.putExtra(NfcAdapter.EXTRA_ID, tag.getId());
-            if (message != null) {
-                intent.putExtra(NfcAdapter.EXTRA_NDEF_MESSAGES, new NdefMessage[] {message});
-                ndefUri = message.getRecords()[0].toUri();
-                ndefMimeType = message.getRecords()[0].toMimeType();
+    boolean isUnSupportedTag(DispatchInfo dispatch, Tag tag) {
+        if (this.mContext.getPackageManager().hasSystemFeature("com.nxp.mifare")) {
+            return DBG;
+        }
+        String popup = CscFeature.getInstance().getString("CscFeature_NFC_EnableSecurityPromptPopup", "mifareclassic");
+        if (popup.toLowerCase().contains("all") || popup.toLowerCase().contains("mifareclassic")) {
+            if (!tag.hasTech(3)) {
+                short[] unSupportedTagTechnology = new short[]{(short) 1, (short) 8, (short) 9, (short) 16, (short) 17, (short) 24, (short) 40, (short) 56, (short) 136};
+                NfcA a = NfcA.get(tag);
+                if (a == null) {
+                    return DBG;
+                }
+                short sak = a.getSak();
+                try {
+                    a.close();
+                } catch (IOException e) {
+                    Log.e(TAG, "Error closing");
+                }
+                for (short s : unSupportedTagTechnology) {
+                    if (sak == s) {
+                        if (this.mToast != null) {
+                            this.mToast.cancel();
+                            Log.d(TAG, "isUnSupportedTag : mToast cancel !!");
+                        }
+                        this.mToast = Toast.makeText(this.mContext, C0027R.string.unsupport_mifare_msg, 0);
+                        this.mToast.show();
+                        return true;
+                    }
+                }
+                return DBG;
+            } else if (!DBG) {
+                return DBG;
             } else {
-                ndefUri = null;
-                ndefMimeType = null;
+                Log.d(TAG, "isUnSupportedTag : This tag also supports ISO_DEP Tech");
+                return DBG;
             }
-
-            rootIntent = new Intent(context, NfcRootActivity.class);
-            rootIntent.putExtra(NfcRootActivity.EXTRA_LAUNCH_INTENT, intent);
-            rootIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-
-            this.context = context;
-            packageManager = context.getPackageManager();
-        }
-
-        public Intent setNdefIntent() {
-            intent.setAction(NfcAdapter.ACTION_NDEF_DISCOVERED);
-            if (ndefUri != null) {
-                intent.setData(ndefUri);
-                return intent;
-            } else if (ndefMimeType != null) {
-                intent.setType(ndefMimeType);
-                return intent;
-            }
-            return null;
-        }
-
-        public Intent setTechIntent() {
-            intent.setData(null);
-            intent.setType(null);
-            intent.setAction(NfcAdapter.ACTION_TECH_DISCOVERED);
-            return intent;
-        }
-
-        public Intent setTagIntent() {
-            intent.setData(null);
-            intent.setType(null);
-            intent.setAction(NfcAdapter.ACTION_TAG_DISCOVERED);
-            return intent;
-        }
-
-        /**
-         * Launch the activity via a (single) NFC root task, so that it
-         * creates a new task stack instead of interfering with any existing
-         * task stack for that activity.
-         * NfcRootActivity acts as the task root, it immediately calls
-         * start activity on the intent it is passed.
-         */
-        boolean tryStartActivity() {
-            // Ideally we'd have used startActivityForResult() to determine whether the
-            // NfcRootActivity was able to launch the intent, but startActivityForResult()
-            // is not available on Context. Instead, we query the PackageManager beforehand
-            // to determine if there is an Activity to handle this intent, and base the
-            // result of off that.
-            List<ResolveInfo> activities = packageManager.queryIntentActivitiesAsUser(intent, 0,
-                    ActivityManager.getCurrentUser());
-            if (activities.size() > 0) {
-                context.startActivityAsUser(rootIntent, UserHandle.CURRENT);
-                return true;
-            }
-            return false;
-        }
-
-        boolean tryStartActivity(Intent intentToStart) {
-            List<ResolveInfo> activities = packageManager.queryIntentActivitiesAsUser(
-                    intentToStart, 0, ActivityManager.getCurrentUser());
-            if (activities.size() > 0) {
-                rootIntent.putExtra(NfcRootActivity.EXTRA_LAUNCH_INTENT, intentToStart);
-                context.startActivityAsUser(rootIntent, UserHandle.CURRENT);
-                return true;
-            }
-            return false;
+        } else if (!DBG) {
+            return DBG;
+        } else {
+            Log.d(TAG, "isUnsupportedTag : This feaure is not set");
+            return DBG;
         }
     }
 
-    /** Returns:
-     * <ul>
-     *  <li /> DISPATCH_SUCCESS if dispatched to an activity,
-     *  <li /> DISPATCH_FAIL if no activities were found to dispatch to,
-     *  <li /> DISPATCH_UNLOCK if the tag was used to unlock the device
-     * </ul>
-     */
-    public int dispatchTag(Tag tag) {
-        PendingIntent overrideIntent;
-        IntentFilter[] overrideFilters;
-        String[][] overrideTechLists;
-        String[] provisioningMimes;
-        boolean provisioningOnly;
-
-        synchronized (this) {
-            overrideFilters = mOverrideFilters;
-            overrideIntent = mOverrideIntent;
-            overrideTechLists = mOverrideTechLists;
-            provisioningOnly = mProvisioningOnly;
-            provisioningMimes = mProvisioningMimes;
-        }
-
-        boolean screenUnlocked = false;
-        if (!provisioningOnly &&
-                mScreenStateHelper.checkScreenState() == ScreenStateHelper.SCREEN_STATE_ON_LOCKED) {
-            screenUnlocked = handleNfcUnlock(tag);
-            if (!screenUnlocked) {
-                return DISPATCH_FAIL;
-            }
-        }
-
+    public boolean dispatchTag(Tag tag) {
         NdefMessage message = null;
         Ndef ndef = Ndef.get(tag);
         if (ndef != null) {
             message = ndef.getCachedNdefMessage();
-        } else {
-            NfcBarcode nfcBarcode = NfcBarcode.get(tag);
-            if (nfcBarcode != null && nfcBarcode.getType() == NfcBarcode.TYPE_KOVIO) {
-                message = decodeNfcBarcodeUri(nfcBarcode);
-            }
         }
-
-        if (DBG) Log.d(TAG, "dispatch tag: " + tag.toString() + " message: " + message);
-
-        DispatchInfo dispatch = new DispatchInfo(mContext, tag, message);
-
+        if (DBG) {
+            Log.d(TAG, "dispatch tag: " + tag.toString() + " message: " + message);
+        }
+        DispatchInfo dispatch = new DispatchInfo(this.mContext, tag, message);
+        synchronized (this) {
+            IntentFilter[] overrideFilters = this.mOverrideFilters;
+            PendingIntent overrideIntent = this.mOverrideIntent;
+            String[][] overrideTechLists = this.mOverrideTechLists;
+            boolean provisioningOnly = this.mProvisioningOnly;
+        }
         resumeAppSwitches();
-
-        if (tryOverrides(dispatch, tag, message, overrideIntent, overrideFilters,
-                overrideTechLists)) {
-            return screenUnlocked ? DISPATCH_UNLOCK : DISPATCH_SUCCESS;
+        isUnSupportedTag(dispatch, tag);
+        if (handleInputValidatioin(dispatch, message)) {
+            return DBG;
         }
-
-        if (tryPeripheralHandover(message)) {
-            if (DBG) Log.i(TAG, "matched BT HANDOVER");
-            return screenUnlocked ? DISPATCH_UNLOCK : DISPATCH_SUCCESS;
+        if (handleSecurityPopup(dispatch, message)) {
+            return DBG;
         }
-
-        if (NfcWifiProtectedSetup.tryNfcWifiSetup(ndef, mContext)) {
-            if (DBG) Log.i(TAG, "matched NFC WPS TOKEN");
-            return screenUnlocked ? DISPATCH_UNLOCK : DISPATCH_SUCCESS;
+        if (tryOverrides(dispatch, tag, message, overrideIntent, overrideFilters, overrideTechLists)) {
+            return true;
         }
-
-        if (provisioningOnly) {
-            if (message == null) {
-                // We only allow NDEF-message dispatch in provisioning mode
-                return DISPATCH_FAIL;
+        if (!provisioningOnly && this.mHandoverManager.tryHandover(message)) {
+            if (DBG) {
+                Log.i(TAG, "matched BT HANDOVER");
             }
-            // Restrict to mime-types in whitelist.
-            String ndefMimeType = message.getRecords()[0].toMimeType();
-            if (provisioningMimes == null ||
-                    !(Arrays.asList(provisioningMimes).contains(ndefMimeType))) {
-                Log.e(TAG, "Dropping NFC intent in provisioning mode.");
-                return DISPATCH_FAIL;
+            return true;
+        } else if (tryNdef(dispatch, message, provisioningOnly)) {
+            return true;
+        } else {
+            if (provisioningOnly) {
+                return DBG;
             }
-        }
-
-        if (tryNdef(dispatch, message)) {
-            return screenUnlocked ? DISPATCH_UNLOCK : DISPATCH_SUCCESS;
-        }
-
-        if (screenUnlocked) {
-            // We only allow NDEF-based mimeType matching in case of an unlock
-            return DISPATCH_UNLOCK;
-        }
-
-        // Only allow NDEF-based mimeType matching for unlock tags
-        if (tryTech(dispatch, tag)) {
-            return DISPATCH_SUCCESS;
-        }
-
-        dispatch.setTagIntent();
-        if (dispatch.tryStartActivity()) {
-            if (DBG) Log.i(TAG, "matched TAG");
-            return DISPATCH_SUCCESS;
-        }
-
-        if (DBG) Log.i(TAG, "no match");
-        return DISPATCH_FAIL;
-    }
-
-    private boolean handleNfcUnlock(Tag tag) {
-        return mNfcUnlockManager.tryUnlock(tag);
-    }
-
-    /**
-     * Checks for the presence of a URL stored in a tag with tech NfcBarcode.
-     * If found, decodes URL and returns NdefMessage message containing an
-     * NdefRecord containing the decoded URL. If not found, returns null.
-     *
-     * URLs are decoded as follows:
-     *
-     * Ignore first byte (which is 0x80 ORd with a manufacturer ID, corresponding
-     * to ISO/IEC 7816-6).
-     * The second byte describes the payload data format. There are four defined data
-     * format values that identify URL data. Depending on the data format value, the
-     * associated prefix is appended to the URL data:
-     *
-     * 0x01: URL with "http://www." prefix
-     * 0x02: URL with "https://www." prefix
-     * 0x03: URL with "http://" prefix
-     * 0x04: URL with "https://" prefix
-     *
-     * Other data format values do not identify URL data and are not handled by this function.
-     * URL payload is encoded in US-ASCII, following the limitations defined in RFC3987.
-     * see http://www.ietf.org/rfc/rfc3987.txt
-     *
-     * The final two bytes of a tag with tech NfcBarcode are always reserved for CRC data,
-     * and are therefore not part of the payload. They are ignored in the decoding of a URL.
-     *
-     * The default assumption is that the URL occupies the entire payload of the NfcBarcode
-     * ID and all bytes of the NfcBarcode payload are decoded until the CRC (final two bytes)
-     * is reached. However, the OPTIONAL early terminator byte 0xfe can be used to signal
-     * an early end of the URL. Once this function reaches an early terminator byte 0xfe,
-     * URL decoding stops and the NdefMessage is created and returned. Any payload data after
-     * the first early terminator byte is ignored for the purposes of URL decoding.
-     */
-    private NdefMessage decodeNfcBarcodeUri(NfcBarcode nfcBarcode) {
-        final byte URI_PREFIX_HTTP_WWW  = (byte) 0x01; // "http://www."
-        final byte URI_PREFIX_HTTPS_WWW = (byte) 0x02; // "https://www."
-        final byte URI_PREFIX_HTTP      = (byte) 0x03; // "http://"
-        final byte URI_PREFIX_HTTPS     = (byte) 0x04; // "https://"
-
-        NdefMessage message = null;
-        byte[] tagId = nfcBarcode.getTag().getId();
-        // All tags of NfcBarcode technology and Kovio type have lengths of a multiple of 16 bytes
-        if (tagId.length >= 4
-                && (tagId[1] == URI_PREFIX_HTTP_WWW || tagId[1] == URI_PREFIX_HTTPS_WWW
-                    || tagId[1] == URI_PREFIX_HTTP || tagId[1] == URI_PREFIX_HTTPS)) {
-            // Look for optional URI terminator (0xfe), used to indicate the end of a URI prior to
-            // the end of the full NfcBarcode payload. No terminator means that the URI occupies the
-            // entire length of the payload field. Exclude checking the CRC in the final two bytes
-            // of the NfcBarcode tagId.
-            int end = 2;
-            for (; end < tagId.length - 2; end++) {
-                if (tagId[end] == (byte) 0xfe) {
-                    break;
+            if (tryTech(dispatch, tag)) {
+                return true;
+            }
+            dispatch.setTagIntent();
+            if (dispatch.tryStartActivity()) {
+                if (DBG) {
+                    Log.i(TAG, "matched TAG");
                 }
+                return true;
             }
-            byte[] payload = new byte[end - 1]; // Skip also first byte (manufacturer ID)
-            System.arraycopy(tagId, 1, payload, 0, payload.length);
-            NdefRecord uriRecord = new NdefRecord(
-                    NdefRecord.TNF_WELL_KNOWN, NdefRecord.RTD_URI, tagId, payload);
-            message = new NdefMessage(uriRecord);
+            if (DBG) {
+                Log.i(TAG, "no match");
+            }
+            return DBG;
         }
-        return message;
     }
 
-    boolean tryOverrides(DispatchInfo dispatch, Tag tag, NdefMessage message, PendingIntent overrideIntent,
-            IntentFilter[] overrideFilters, String[][] overrideTechLists) {
+    boolean tryOverrides(DispatchInfo dispatch, Tag tag, NdefMessage message, PendingIntent overrideIntent, IntentFilter[] overrideFilters, String[][] overrideTechLists) {
         if (overrideIntent == null) {
-            return false;
+            return DBG;
         }
         Intent intent;
-
-        // NDEF
         if (message != null) {
             intent = dispatch.setNdefIntent();
-            if (intent != null &&
-                    isFilterMatch(intent, overrideFilters, overrideTechLists != null)) {
-                try {
-                    overrideIntent.send(mContext, Activity.RESULT_OK, intent);
-                    if (DBG) Log.i(TAG, "matched NDEF override");
-                    return true;
-                } catch (CanceledException e) {
-                    return false;
+            if (intent != null) {
+                if (isFilterMatch(intent, overrideFilters, overrideTechLists != null ? true : DBG)) {
+                    try {
+                        overrideIntent.send(this.mContext, -1, intent);
+                        if (DBG) {
+                            Log.i(TAG, "matched NDEF override");
+                        }
+                        return true;
+                    } catch (CanceledException e) {
+                        return DBG;
+                    }
                 }
             }
         }
-
-        // TECH
         intent = dispatch.setTechIntent();
         if (isTechMatch(tag, overrideTechLists)) {
             try {
-                overrideIntent.send(mContext, Activity.RESULT_OK, intent);
-                if (DBG) Log.i(TAG, "matched TECH override");
+                overrideIntent.send(this.mContext, -1, intent);
+                if (DBG) {
+                    Log.i(TAG, "matched TECH override");
+                }
                 return true;
-            } catch (CanceledException e) {
-                return false;
+            } catch (CanceledException e2) {
+                return DBG;
             }
         }
-
-        // TAG
+        boolean z;
         intent = dispatch.setTagIntent();
-        if (isFilterMatch(intent, overrideFilters, overrideTechLists != null)) {
-            try {
-                overrideIntent.send(mContext, Activity.RESULT_OK, intent);
-                if (DBG) Log.i(TAG, "matched TAG override");
-                return true;
-            } catch (CanceledException e) {
-                return false;
-            }
+        if (overrideTechLists != null) {
+            z = true;
+        } else {
+            z = DBG;
         }
-        return false;
+        if (!isFilterMatch(intent, overrideFilters, z)) {
+            return DBG;
+        }
+        try {
+            overrideIntent.send(this.mContext, -1, intent);
+            if (DBG) {
+                Log.i(TAG, "matched TAG override");
+            }
+            return true;
+        } catch (CanceledException e3) {
+            return DBG;
+        }
     }
 
     boolean isFilterMatch(Intent intent, IntentFilter[] filters, boolean hasTechFilter) {
         if (filters != null) {
             for (IntentFilter filter : filters) {
-                if (filter.match(mContentResolver, intent, false, TAG) >= 0) {
+                if (filter.match(this.mContentResolver, intent, DBG, TAG) >= 0) {
                     return true;
                 }
             }
         } else if (!hasTechFilter) {
-            return true;  // always match if both filters and techlists are null
+            return true;
         }
-        return false;
+        return DBG;
     }
 
     boolean isTechMatch(Tag tag, String[][] techLists) {
         if (techLists == null) {
-            return false;
+            return DBG;
         }
-
         String[] tagTechs = tag.getTechList();
         Arrays.sort(tagTechs);
         for (String[] filterTechs : techLists) {
@@ -460,65 +477,461 @@ class NfcDispatcher {
                 return true;
             }
         }
-        return false;
+        return DBG;
     }
 
-    boolean tryNdef(DispatchInfo dispatch, NdefMessage message) {
-        if (message == null) {
-            return false;
-        }
-        Intent intent = dispatch.setNdefIntent();
+    /* JADX WARNING: inconsistent code. */
+    /* Code decompiled incorrectly, please refer to instructions dump. */
+    boolean tryNdef(com.android.nfc.NfcDispatcher.DispatchInfo r25, android.nfc.NdefMessage r26, boolean r27) {
+        /*
+        r24 = this;
+        if (r26 != 0) goto L_0x0005;
+    L_0x0002:
+        r21 = 0;
+    L_0x0004:
+        return r21;
+    L_0x0005:
+        r12 = r25.setNdefIntent();
+        if (r12 != 0) goto L_0x000e;
+    L_0x000b:
+        r21 = 0;
+        goto L_0x0004;
+    L_0x000e:
+        if (r27 == 0) goto L_0x0036;
+    L_0x0010:
+        r0 = r24;
+        r0 = r0.mProvisioningMimes;
+        r21 = r0;
+        if (r21 == 0) goto L_0x002c;
+    L_0x0018:
+        r0 = r24;
+        r0 = r0.mProvisioningMimes;
+        r21 = r0;
+        r21 = java.util.Arrays.asList(r21);
+        r22 = r12.getType();
+        r21 = r21.contains(r22);
+        if (r21 != 0) goto L_0x0036;
+    L_0x002c:
+        r21 = "NfcDispatcher";
+        r22 = "Dropping NFC intent in provisioning mode.";
+        android.util.Log.e(r21, r22);
+        r21 = 0;
+        goto L_0x0004;
+    L_0x0036:
+        r6 = r26.getRecords();
+        r13 = r6.length;
+        r11 = 0;
+    L_0x003c:
+        if (r11 >= r13) goto L_0x007c;
+    L_0x003e:
+        r18 = r6[r11];
+        r21 = r18.getTnf();
+        r22 = 4;
+        r0 = r21;
+        r1 = r22;
+        if (r0 != r1) goto L_0x0070;
+    L_0x004c:
+        r21 = r18.getType();
+        r22 = "samsung.com:facebook";
+        r22 = r22.getBytes();
+        r21 = java.util.Arrays.equals(r21, r22);
+        if (r21 == 0) goto L_0x0070;
+    L_0x005c:
+        r21 = r25.tryStartActivity();
+        if (r21 == 0) goto L_0x0079;
+    L_0x0062:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x006d;
+    L_0x0066:
+        r21 = "NfcDispatcher";
+        r22 = "found facebook record";
+        android.util.Log.i(r21, r22);
+    L_0x006d:
+        r21 = 1;
+        goto L_0x0004;
+    L_0x0070:
+        r21 = r18.getTnf();
+        if (r21 != 0) goto L_0x0079;
+    L_0x0076:
+        r21 = 0;
+        goto L_0x0004;
+    L_0x0079:
+        r11 = r11 + 1;
+        goto L_0x003c;
+    L_0x007c:
+        r4 = extractAarPackages(r26);
+        r11 = r4.iterator();
+    L_0x0084:
+        r21 = r11.hasNext();
+        if (r21 == 0) goto L_0x00b0;
+    L_0x008a:
+        r15 = r11.next();
+        r15 = (java.lang.String) r15;
+        r0 = r25;
+        r0 = r0.intent;
+        r21 = r0;
+        r0 = r21;
+        r0.setPackage(r15);
+        r21 = r25.tryStartActivity();
+        if (r21 == 0) goto L_0x0084;
+    L_0x00a1:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x00ac;
+    L_0x00a5:
+        r21 = "NfcDispatcher";
+        r22 = "matched AAR to NDEF";
+        android.util.Log.i(r21, r22);
+    L_0x00ac:
+        r21 = 1;
+        goto L_0x0004;
+    L_0x00b0:
+        r3 = extractSamsungPackages(r26);
+        r11 = r3.iterator();
+    L_0x00b8:
+        r21 = r11.hasNext();
+        if (r21 == 0) goto L_0x0123;
+    L_0x00be:
+        r15 = r11.next();
+        r15 = (java.lang.String) r15;
+        r21 = "com.sec.android.homesync";
+        r0 = r21;
+        r21 = r15.equals(r0);
+        if (r21 != 0) goto L_0x00b8;
+    L_0x00ce:
+        r0 = r25;
+        r0 = r0.intent;
+        r21 = r0;
+        r0 = r21;
+        r0.setPackage(r15);
+        r21 = r25.tryStartActivity();
+        if (r21 == 0) goto L_0x00ea;
+    L_0x00df:
+        r21 = "NfcDispatcher";
+        r22 = "String matched SAR to NDEF";
+        android.util.Log.i(r21, r22);
+        r21 = 1;
+        goto L_0x0004;
+    L_0x00ea:
+        r21 = new java.lang.StringBuilder;
+        r21.<init>();
+        r0 = r21;
+        r21 = r0.append(r15);
+        r22 = "stub";
+        r21 = r21.append(r22);
+        r21 = r21.toString();
+        r0 = r25;
+        r1 = r21;
+        r21 = r0.tryStartActivity(r1);
+        if (r21 == 0) goto L_0x00b8;
+    L_0x0109:
+        r0 = r24;
+        r1 = r26;
+        r7 = r0.extractBtAddr(r1);
+        if (r7 == 0) goto L_0x0118;
+    L_0x0113:
+        r0 = r24;
+        r0.saveBtAddr(r15, r7);
+    L_0x0118:
+        r21 = "NfcDispatcher";
+        r22 = "String matched SAR with stub to NDEF";
+        android.util.Log.i(r21, r22);
+        r21 = 1;
+        goto L_0x0004;
+    L_0x0123:
+        r0 = r24;
+        r1 = r26;
+        r7 = r0.extractBtAddr(r1);
+        if (r7 == 0) goto L_0x0144;
+    L_0x012d:
+        r21 = r4.size();
+        if (r21 <= 0) goto L_0x01da;
+    L_0x0133:
+        r21 = 0;
+        r0 = r21;
+        r16 = r4.get(r0);
+        r16 = (java.lang.String) r16;
+        r0 = r24;
+        r1 = r16;
+        r0.saveBtAddr(r1, r7);
+    L_0x0144:
+        r21 = r3.size();
+        if (r21 <= 0) goto L_0x023e;
+    L_0x014a:
+        r21 = 0;
+        r0 = r21;
+        r10 = r3.get(r0);
+        r10 = (java.lang.String) r10;
+        r20 = "";
+        r8 = new android.os.UserHandle;	 Catch:{ NameNotFoundException -> 0x0200 }
+        r21 = android.app.ActivityManager.getCurrentUser();	 Catch:{ NameNotFoundException -> 0x0200 }
+        r0 = r21;
+        r8.<init>(r0);	 Catch:{ NameNotFoundException -> 0x0200 }
+        r0 = r24;
+        r0 = r0.mContext;	 Catch:{ NameNotFoundException -> 0x0200 }
+        r21 = r0;
+        r22 = "android";
+        r23 = 0;
+        r0 = r21;
+        r1 = r22;
+        r2 = r23;
+        r21 = r0.createPackageContextAsUser(r1, r2, r8);	 Catch:{ NameNotFoundException -> 0x0200 }
+        r17 = r21.getPackageManager();	 Catch:{ NameNotFoundException -> 0x0200 }
+        r21 = DBG;
+        if (r21 == 0) goto L_0x0197;
+    L_0x017d:
+        r21 = "NfcDispatcher";
+        r22 = new java.lang.StringBuilder;
+        r22.<init>();
+        r23 = "firstPackage Name : ";
+        r22 = r22.append(r23);
+        r0 = r22;
+        r22 = r0.append(r10);
+        r22 = r22.toString();
+        android.util.Log.i(r21, r22);
+    L_0x0197:
+        r0 = r24;
+        r1 = r26;
+        r20 = r0.HaveHomesyncAPK(r10, r1);
+        r0 = r17;
+        r5 = r0.getLaunchIntentForPackage(r10);
+        if (r5 == 0) goto L_0x020c;
+    L_0x01a7:
+        r21 = r20.length();
+        r22 = 2;
+        r0 = r21;
+        r1 = r22;
+        if (r0 <= r1) goto L_0x01c3;
+    L_0x01b3:
+        r21 = "NfcDispatcher";
+        r22 = "appLaunchIntent.putExtra(bt_addr, strAddr);";
+        android.util.Log.i(r21, r22);
+        r21 = "bt_addr";
+        r0 = r21;
+        r1 = r20;
+        r5.putExtra(r0, r1);
+    L_0x01c3:
+        r0 = r25;
+        r21 = r0.tryStartActivity(r5);
+        if (r21 == 0) goto L_0x020c;
+    L_0x01cb:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x01d6;
+    L_0x01cf:
+        r21 = "NfcDispatcher";
+        r22 = "matched SamsungPackages to application launch";
+        android.util.Log.i(r21, r22);
+    L_0x01d6:
+        r21 = 1;
+        goto L_0x0004;
+    L_0x01da:
+        r21 = r3.size();
+        if (r21 <= 0) goto L_0x01f3;
+    L_0x01e0:
+        r21 = 0;
+        r0 = r21;
+        r16 = r3.get(r0);
+        r16 = (java.lang.String) r16;
+        r0 = r24;
+        r1 = r16;
+        r0.saveBtAddr(r1, r7);
+        goto L_0x0144;
+    L_0x01f3:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x0144;
+    L_0x01f7:
+        r21 = "NfcDispatcher";
+        r22 = "no matched AAR or SAR";
+        android.util.Log.i(r21, r22);
+        goto L_0x0144;
+    L_0x0200:
+        r9 = move-exception;
+        r21 = "NfcDispatcher";
+        r22 = "Could not create user package context";
+        android.util.Log.e(r21, r22);
+        r21 = 0;
+        goto L_0x0004;
+    L_0x020c:
+        r19 = getSamsungAppSearchIntent(r10);
+        if (r19 == 0) goto L_0x023e;
+    L_0x0212:
+        r0 = r25;
+        r1 = r19;
+        r21 = r0.tryStartActivity(r1);
+        if (r21 == 0) goto L_0x023e;
+    L_0x021c:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x0227;
+    L_0x0220:
+        r21 = "NfcDispatcher";
+        r22 = "matched SamsungApps to market launch";
+        android.util.Log.i(r21, r22);
+    L_0x0227:
+        r21 = r20.length();
+        r22 = 2;
+        r0 = r21;
+        r1 = r22;
+        if (r0 <= r1) goto L_0x023a;
+    L_0x0233:
+        r0 = r24;
+        r1 = r20;
+        r0.saveHomeSyncData(r1);
+    L_0x023a:
+        r21 = 1;
+        goto L_0x0004;
+    L_0x023e:
+        r21 = r4.size();
+        if (r21 <= 0) goto L_0x0309;
+    L_0x0244:
+        r21 = 0;
+        r0 = r21;
+        r10 = r4.get(r0);
+        r10 = (java.lang.String) r10;
+        r20 = "";
+        r8 = new android.os.UserHandle;	 Catch:{ NameNotFoundException -> 0x02cd }
+        r21 = android.app.ActivityManager.getCurrentUser();	 Catch:{ NameNotFoundException -> 0x02cd }
+        r0 = r21;
+        r8.<init>(r0);	 Catch:{ NameNotFoundException -> 0x02cd }
+        r0 = r24;
+        r0 = r0.mContext;	 Catch:{ NameNotFoundException -> 0x02cd }
+        r21 = r0;
+        r22 = "android";
+        r23 = 0;
+        r0 = r21;
+        r1 = r22;
+        r2 = r23;
+        r21 = r0.createPackageContextAsUser(r1, r2, r8);	 Catch:{ NameNotFoundException -> 0x02cd }
+        r17 = r21.getPackageManager();	 Catch:{ NameNotFoundException -> 0x02cd }
+        r21 = DBG;
+        if (r21 == 0) goto L_0x0291;
+    L_0x0277:
+        r21 = "NfcDispatcher";
+        r22 = new java.lang.StringBuilder;
+        r22.<init>();
+        r23 = "firstPackage Name : ";
+        r22 = r22.append(r23);
+        r0 = r22;
+        r22 = r0.append(r10);
+        r22 = r22.toString();
+        android.util.Log.i(r21, r22);
+    L_0x0291:
+        r0 = r24;
+        r1 = r26;
+        r20 = r0.HaveHomesyncAPK(r10, r1);
+        r0 = r17;
+        r5 = r0.getLaunchIntentForPackage(r10);
+        if (r5 == 0) goto L_0x02d9;
+    L_0x02a1:
+        r21 = r20.length();
+        r22 = 2;
+        r0 = r21;
+        r1 = r22;
+        if (r0 <= r1) goto L_0x02b6;
+    L_0x02ad:
+        r21 = "bt_addr";
+        r0 = r21;
+        r1 = r20;
+        r5.putExtra(r0, r1);
+    L_0x02b6:
+        r0 = r25;
+        r21 = r0.tryStartActivity(r5);
+        if (r21 == 0) goto L_0x02d9;
+    L_0x02be:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x02c9;
+    L_0x02c2:
+        r21 = "NfcDispatcher";
+        r22 = "matched AAR to application launch";
+        android.util.Log.i(r21, r22);
+    L_0x02c9:
+        r21 = 1;
+        goto L_0x0004;
+    L_0x02cd:
+        r9 = move-exception;
+        r21 = "NfcDispatcher";
+        r22 = "Could not create user package context";
+        android.util.Log.e(r21, r22);
+        r21 = 0;
+        goto L_0x0004;
+    L_0x02d9:
+        r14 = getAppSearchIntent(r10);
+        if (r14 == 0) goto L_0x0309;
+    L_0x02df:
+        r0 = r25;
+        r21 = r0.tryStartActivity(r14);
+        if (r21 == 0) goto L_0x0309;
+    L_0x02e7:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x02f2;
+    L_0x02eb:
+        r21 = "NfcDispatcher";
+        r22 = "matched AAR to market launch";
+        android.util.Log.i(r21, r22);
+    L_0x02f2:
+        r21 = r20.length();
+        r22 = 2;
+        r0 = r21;
+        r1 = r22;
+        if (r0 <= r1) goto L_0x0305;
+    L_0x02fe:
+        r0 = r24;
+        r1 = r20;
+        r0.saveHomeSyncData(r1);
+    L_0x0305:
+        r21 = 1;
+        goto L_0x0004;
+    L_0x0309:
+        r0 = r25;
+        r0 = r0.intent;
+        r21 = r0;
+        r22 = 0;
+        r21.setPackage(r22);
+        r21 = r25.tryStartActivity();
+        if (r21 == 0) goto L_0x0329;
+    L_0x031a:
+        r21 = DBG;
+        if (r21 == 0) goto L_0x0325;
+    L_0x031e:
+        r21 = "NfcDispatcher";
+        r22 = "matched NDEF";
+        android.util.Log.i(r21, r22);
+    L_0x0325:
+        r21 = 1;
+        goto L_0x0004;
+    L_0x0329:
+        r21 = 0;
+        goto L_0x0004;
+        */
+        throw new UnsupportedOperationException("Method not decompiled: com.android.nfc.NfcDispatcher.tryNdef(com.android.nfc.NfcDispatcher$DispatchInfo, android.nfc.NdefMessage, boolean):boolean");
+    }
 
-        // Bail out if the intent does not contain filterable NDEF data
-        if (intent == null) return false;
-
-        // Try to start AAR activity with matching filter
-        List<String> aarPackages = extractAarPackages(message);
-        for (String pkg : aarPackages) {
-            dispatch.intent.setPackage(pkg);
-            if (dispatch.tryStartActivity()) {
-                if (DBG) Log.i(TAG, "matched AAR to NDEF");
-                return true;
+    String extractBtAddr(NdefMessage message) {
+        String btAddr = "";
+        NdefRecord firstRecord = message.getRecords()[0];
+        String rtn_cmp = new String(firstRecord.getType(), StandardCharsets.US_ASCII);
+        if (firstRecord.getTnf() == (short) 2 && rtn_cmp.contains(TYPE_NAME_SEC_OOB)) {
+            btAddr = new String(firstRecord.getPayload());
+            Log.i(TAG, "extractBtAddr : Bluetooth addr : ");
+            if (17 == btAddr.length()) {
+                return btAddr;
             }
+            Log.i(TAG, "extractBtAddr : invalid btAddr : ");
+            return null;
+        } else if (!DBG) {
+            return null;
+        } else {
+            Log.i(TAG, "extractBtAddr : failed ");
+            return null;
         }
+    }
 
-        // Try to perform regular launch of the first AAR
-        if (aarPackages.size() > 0) {
-            String firstPackage = aarPackages.get(0);
-            PackageManager pm;
-            try {
-                UserHandle currentUser = new UserHandle(ActivityManager.getCurrentUser());
-                pm = mContext.createPackageContextAsUser("android", 0,
-                        currentUser).getPackageManager();
-            } catch (NameNotFoundException e) {
-                Log.e(TAG, "Could not create user package context");
-                return false;
-            }
-            Intent appLaunchIntent = pm.getLaunchIntentForPackage(firstPackage);
-            if (appLaunchIntent != null && dispatch.tryStartActivity(appLaunchIntent)) {
-                if (DBG) Log.i(TAG, "matched AAR to application launch");
-                return true;
-            }
-            // Find the package in Market:
-            Intent marketIntent = getAppSearchIntent(firstPackage);
-            if (marketIntent != null && dispatch.tryStartActivity(marketIntent)) {
-                if (DBG) Log.i(TAG, "matched AAR to market launch");
-                return true;
-            }
-        }
-
-        // regular launch
-        dispatch.intent.setPackage(null);
-        if (dispatch.tryStartActivity()) {
-            if (DBG) Log.i(TAG, "matched NDEF");
-            return true;
-        }
-
-        return false;
+    void saveBtAddr(String pkg_name, String btAddr) {
+        Editor ed = this.mContext.getSharedPreferences("bt_addr_list", 0).edit();
+        ed.putString(pkg_name, btAddr);
+        ed.commit();
     }
 
     static List<String> extractAarPackages(NdefMessage message) {
-        List<String> aarPackages = new LinkedList<String>();
+        List<String> aarPackages = new LinkedList();
         for (NdefRecord record : message.getRecords()) {
             String pkg = checkForAar(record);
             if (pkg != null) {
@@ -528,144 +941,138 @@ class NfcDispatcher {
         return aarPackages;
     }
 
+    static List<String> extractSamsungPackages(NdefMessage message) {
+        List<String> SamsungPackages = new LinkedList();
+        for (NdefRecord record : message.getRecords()) {
+            String pkg = checkForSamsungPackage(record);
+            if (pkg != null) {
+                SamsungPackages.add(pkg);
+            }
+        }
+        return SamsungPackages;
+    }
+
+    String HaveHomesyncAPK(String firstPackage, NdefMessage message) {
+        String strAddr = "";
+        if (!firstPackage.equals(HOMESYNC_PACKAGE_NAME)) {
+            return strAddr;
+        }
+        strAddr = new String(message.getRecords()[0].getPayload());
+        Log.i(TAG, "com.sec.android.homesyncBluetooth addr : " + strAddr);
+        return strAddr;
+    }
+
+    void saveHomeSyncData(String strAddr) {
+        Editor editor = this.mContext.getSharedPreferences("homesync", 0).edit();
+        editor.putString("bt_addr", strAddr);
+        editor.commit();
+    }
+
     boolean tryTech(DispatchInfo dispatch, Tag tag) {
         dispatch.setTechIntent();
-
         String[] tagTechs = tag.getTechList();
         Arrays.sort(tagTechs);
-
-        // Standard tech dispatch path
-        ArrayList<ResolveInfo> matches = new ArrayList<ResolveInfo>();
-        List<ComponentInfo> registered = mTechListFilters.getComponents();
-
-        PackageManager pm;
+        ArrayList<ResolveInfo> matches = new ArrayList();
+        List<ComponentInfo> registered = this.mTechListFilters.getComponents();
         try {
-            UserHandle currentUser = new UserHandle(ActivityManager.getCurrentUser());
-            pm = mContext.createPackageContextAsUser("android", 0,
-                    currentUser).getPackageManager();
-        } catch (NameNotFoundException e) {
-            Log.e(TAG, "Could not create user package context");
-            return false;
-        }
-        // Check each registered activity to see if it matches
-        for (ComponentInfo info : registered) {
-            // Don't allow wild card matching
-            if (filterMatch(tagTechs, info.techs) &&
-                    isComponentEnabled(pm, info.resolveInfo)) {
-                // Add the activity as a match if it's not already in the list
-                if (!matches.contains(info.resolveInfo)) {
+            PackageManager pm = this.mContext.createPackageContextAsUser("android", 0, new UserHandle(ActivityManager.getCurrentUser())).getPackageManager();
+            for (ComponentInfo info : registered) {
+                if (filterMatch(tagTechs, info.techs) && isComponentEnabled(pm, info.resolveInfo) && !matches.contains(info.resolveInfo)) {
                     matches.add(info.resolveInfo);
                 }
             }
-        }
-
-        if (matches.size() == 1) {
-            // Single match, launch directly
-            ResolveInfo info = matches.get(0);
-            dispatch.intent.setClassName(info.activityInfo.packageName, info.activityInfo.name);
-            if (dispatch.tryStartActivity()) {
-                if (DBG) Log.i(TAG, "matched single TECH");
-                return true;
+            if (matches.size() == 1) {
+                ResolveInfo info2 = (ResolveInfo) matches.get(0);
+                dispatch.intent.setClassName(info2.activityInfo.packageName, info2.activityInfo.name);
+                if (dispatch.tryStartActivity()) {
+                    if (DBG) {
+                        Log.i(TAG, "matched single TECH");
+                    }
+                    return true;
+                }
+                dispatch.intent.setComponent(null);
+            } else if (matches.size() > 1) {
+                Intent intent = new Intent(this.mContext, TechListChooserActivity.class);
+                intent.putExtra("android.intent.extra.INTENT", dispatch.intent);
+                intent.putParcelableArrayListExtra(TechListChooserActivity.EXTRA_RESOLVE_INFOS, matches);
+                if (dispatch.tryStartActivity(intent)) {
+                    if (DBG) {
+                        Log.i(TAG, "matched multiple TECH");
+                    }
+                    return true;
+                }
             }
-            dispatch.intent.setComponent(null);
-        } else if (matches.size() > 1) {
-            // Multiple matches, show a custom activity chooser dialog
-            Intent intent = new Intent(mContext, TechListChooserActivity.class);
-            intent.putExtra(Intent.EXTRA_INTENT, dispatch.intent);
-            intent.putParcelableArrayListExtra(TechListChooserActivity.EXTRA_RESOLVE_INFOS,
-                    matches);
-            if (dispatch.tryStartActivity(intent)) {
-                if (DBG) Log.i(TAG, "matched multiple TECH");
-                return true;
-            }
+            return DBG;
+        } catch (NameNotFoundException e) {
+            Log.e(TAG, "Could not create user package context");
+            return DBG;
         }
-        return false;
     }
 
-    public boolean tryPeripheralHandover(NdefMessage m) {
-        if (m == null || !mDeviceSupportsBluetooth) return false;
-
-        if (DBG) Log.d(TAG, "tryHandover(): " + m.toString());
-
-        HandoverDataParser.BluetoothHandoverData handover = mHandoverDataParser.parseBluetooth(m);
-        if (handover == null || !handover.valid) return false;
-        if (UserManager.get(mContext).hasUserRestriction(
-                UserManager.DISALLOW_CONFIG_BLUETOOTH,
-                // hasUserRestriction does not support UserHandle.CURRENT
-                UserHandle.of(ActivityManager.getCurrentUser()))) {
-            return false;
-        }
-
-        Intent intent = new Intent(mContext, PeripheralHandoverService.class);
-        intent.putExtra(PeripheralHandoverService.EXTRA_PERIPHERAL_DEVICE, handover.device);
-        intent.putExtra(PeripheralHandoverService.EXTRA_PERIPHERAL_NAME, handover.name);
-        intent.putExtra(PeripheralHandoverService.EXTRA_PERIPHERAL_TRANSPORT, handover.transport);
-        if (handover.oobData != null) {
-            intent.putExtra(PeripheralHandoverService.EXTRA_PERIPHERAL_OOB_DATA, handover.oobData);
-        }
-        mContext.startServiceAsUser(intent, UserHandle.CURRENT);
-
-        return true;
-    }
-
-
-    /**
-     * Tells the ActivityManager to resume allowing app switches.
-     *
-     * If the current app called stopAppSwitches() then our startActivity() can
-     * be delayed for several seconds. This happens with the default home
-     * screen.  As a system service we can override this behavior with
-     * resumeAppSwitches().
-    */
     void resumeAppSwitches() {
         try {
-            mIActivityManager.resumeAppSwitches();
-        } catch (RemoteException e) { }
+            this.mIActivityManager.resumeAppSwitches();
+        } catch (RemoteException e) {
+        }
     }
 
-    /** Returns true if the tech list filter matches the techs on the tag */
     boolean filterMatch(String[] tagTechs, String[] filterTechs) {
-        if (filterTechs == null || filterTechs.length == 0) return false;
-
+        if (filterTechs == null || filterTechs.length == 0) {
+            return DBG;
+        }
         for (String tech : filterTechs) {
             if (Arrays.binarySearch(tagTechs, tech) < 0) {
-                return false;
+                return DBG;
             }
         }
         return true;
     }
 
     static String checkForAar(NdefRecord record) {
-        if (record.getTnf() == NdefRecord.TNF_EXTERNAL_TYPE &&
-                Arrays.equals(record.getType(), NdefRecord.RTD_ANDROID_APP)) {
+        if (record.getTnf() == (short) 4 && Arrays.equals(record.getType(), NdefRecord.RTD_ANDROID_APP)) {
             return new String(record.getPayload(), StandardCharsets.US_ASCII);
         }
         return null;
     }
 
-    /**
-     * Returns an intent that can be used to find an application not currently
-     * installed on the device.
-     */
+    static String checkForSamsungPackage(NdefRecord record) {
+        String SamsungPrefix = "samsungapps://ProductDetail/";
+        String packageName = null;
+        if (record.getTnf() != (short) 1 || !Arrays.equals(record.getType(), NdefRecord.RTD_URI)) {
+            return null;
+        }
+        String payload = new String(record.getPayload());
+        if (payload.regionMatches(1, "samsungapps://ProductDetail/", 0, "samsungapps://ProductDetail/".length())) {
+            String[] ArStr = payload.split("/");
+            if (ArStr.length > 0) {
+                packageName = ArStr[ArStr.length - 1];
+                Log.d(TAG, "SamsungApp find - name : " + packageName);
+            }
+        }
+        return packageName;
+    }
+
+    static Intent getSamsungAppSearchIntent(String pkg) {
+        Intent market = new Intent("android.intent.action.VIEW");
+        market.setData(Uri.parse("samsungapps://ProductDetail/" + pkg));
+        return market;
+    }
+
     static Intent getAppSearchIntent(String pkg) {
-        Intent market = new Intent(Intent.ACTION_VIEW);
+        Intent market = new Intent("android.intent.action.VIEW");
         market.setData(Uri.parse("market://details?id=" + pkg));
         return market;
     }
 
     static boolean isComponentEnabled(PackageManager pm, ResolveInfo info) {
-        boolean enabled = false;
-        ComponentName compname = new ComponentName(
-                info.activityInfo.packageName, info.activityInfo.name);
+        boolean enabled = DBG;
+        ComponentName compname = new ComponentName(info.activityInfo.packageName, info.activityInfo.name);
         try {
-            // Note that getActivityInfo() will internally call
-            // isEnabledLP() to determine whether the component
-            // enabled. If it's not, null is returned.
-            if (pm.getActivityInfo(compname,0) != null) {
+            if (pm.getActivityInfo(compname, 0) != null) {
                 enabled = true;
             }
-        } catch (PackageManager.NameNotFoundException e) {
-            enabled = false;
+        } catch (NameNotFoundException e) {
+            enabled = DBG;
         }
         if (!enabled) {
             Log.d(TAG, "Component not enabled: " + compname);
@@ -675,9 +1082,85 @@ class NfcDispatcher {
 
     void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
         synchronized (this) {
-            pw.println("mOverrideIntent=" + mOverrideIntent);
-            pw.println("mOverrideFilters=" + mOverrideFilters);
-            pw.println("mOverrideTechLists=" + mOverrideTechLists);
+            pw.println("mOverrideIntent=" + this.mOverrideIntent);
+            pw.println("mOverrideFilters=" + this.mOverrideFilters);
+            pw.println("mOverrideTechLists=" + this.mOverrideTechLists);
         }
+    }
+
+    public void dispatchConnectivity(byte[] aid, byte[] parameter) {
+        if (DBG) {
+            Log.d(TAG, "dispatchConnectivity");
+        }
+        Intent targetIntent = new Intent();
+        targetIntent.setAction("com.sony.nfc.action.TRANSACTION_DETECTED");
+        Builder builder = new Builder();
+        String path = "/" + byte2String(aid);
+        builder.scheme(NfcService.SERVICE_NAME);
+        builder.encodedAuthority("secure:0");
+        builder.path(path);
+        targetIntent.setData(builder.build());
+        if (DBG) {
+            Log.d(TAG, "Intent Uri = " + builder.build().toString());
+        }
+        targetIntent.putExtra("com.sony.extra.DATA", parameter);
+        PackageManager pm = this.mContext.getPackageManager();
+        List<ResolveInfo> registered = pm.queryIntentActivities(targetIntent, 65600);
+        ArrayList<ResolveInfo> matches = new ArrayList();
+        for (ResolveInfo info : registered) {
+            if (hasMatchedDataPath(info, path)) {
+                String packageName = info.activityInfo.packageName;
+                if ((info.match & 5242880) >= 5242880 && pm.checkPermission(NfcController.NFC_CONTROLLER_PERMISSION, packageName) == 0 && !matches.contains(info)) {
+                    matches.add(info);
+                }
+            }
+        }
+        if (matches.size() > 0) {
+            Intent intent = new Intent(this.mContext, TechListChooserActivity.class);
+            intent.addFlags(268435456);
+            intent.putExtra("android.intent.extra.INTENT", targetIntent);
+            intent.putParcelableArrayListExtra(TechListChooserActivity.EXTRA_RESOLVE_INFOS, matches);
+            try {
+                this.mContext.startActivity(intent);
+            } catch (ActivityNotFoundException e) {
+                if (DBG) {
+                    Log.w(TAG, "No activities for Connectivity handling of " + intent);
+                }
+            }
+        } else if (DBG) {
+            Log.w(TAG, "No activities for Connectivity handling");
+        }
+    }
+
+    private boolean hasMatchedDataPath(ResolveInfo info, String data) {
+        if ((info.match & 268369920) < 5242880 || info.filter == null) {
+            return DBG;
+        }
+        Iterator<PatternMatcher> paths = info.filter.pathsIterator();
+        if (paths == null) {
+            return DBG;
+        }
+        while (paths.hasNext()) {
+            PatternMatcher pe = (PatternMatcher) paths.next();
+            if (pe.getType() == 0 && pe.match(data)) {
+                return true;
+            }
+        }
+        return DBG;
+    }
+
+    private String byte2String(byte[] byteData) {
+        if (byteData == null) {
+            return null;
+        }
+        StringBuffer value = new StringBuffer();
+        for (int i = 0; i < byteData.length; i++) {
+            if ((byteData[i] & 255) < 16) {
+                value.append("0" + Integer.toHexString(byteData[i] & 255));
+            } else {
+                value.append(Integer.toHexString(byteData[i] & 255));
+            }
+        }
+        return value.toString();
     }
 }

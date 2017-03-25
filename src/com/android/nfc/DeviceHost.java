@@ -1,240 +1,297 @@
-/*
- * Copyright (C) 2011 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.android.nfc;
 
-import android.annotation.Nullable;
 import android.nfc.NdefMessage;
 import android.os.Bundle;
-
 import java.io.IOException;
 
 public interface DeviceHost {
+
     public interface DeviceHostListener {
-        public void onRemoteEndpointDiscovered(TagEndpoint tag);
+        void onAidRoutingTableFull();
 
-        /**
-         */
-        public void onHostCardEmulationActivated(int technology);
-        public void onHostCardEmulationData(int technology, byte[] data);
-        public void onHostCardEmulationDeactivated(int technology);
+        void onCardEmulationAidSelected(byte[] bArr, byte[] bArr2);
 
-        /**
-         * Notifies P2P Device detected, to activate LLCP link
-         */
-        public void onLlcpLinkActivated(NfcDepEndpoint device);
+        void onCardEmulationAidSelected(byte[] bArr, byte[] bArr2, int i);
 
-        /**
-         * Notifies P2P Device detected, to activate LLCP link
-         */
-        public void onLlcpLinkDeactivated(NfcDepEndpoint device);
+        void onCardEmulationAidSelected4Google(byte[] bArr);
 
-        public void onLlcpFirstPacketReceived(NfcDepEndpoint device);
+        void onCardEmulationDeselected();
 
-        public void onRemoteFieldActivated();
+        void onConnectivityEvent();
 
-        public void onRemoteFieldDeactivated();
-    }
+        void onConnectivityEvent(int i);
 
-    public interface TagEndpoint {
-        boolean connect(int technology);
-        boolean reconnect();
-        boolean disconnect();
+        void onHciEvtTransaction(byte[][] bArr);
 
-        boolean presenceCheck();
-        boolean isPresent();
-        void startPresenceChecking(int presenceCheckDelay,
-                                   @Nullable TagDisconnectedCallback callback);
+        void onHostCardEmulationActivated();
 
-        int[] getTechList();
-        void removeTechnology(int tech); // TODO remove this one
-        Bundle[] getTechExtras();
-        byte[] getUid();
-        int getHandle();
+        void onHostCardEmulationData(byte[] bArr);
 
-        byte[] transceive(byte[] data, boolean raw, int[] returnCode);
+        void onHostCardEmulationDeactivated();
 
-        boolean checkNdef(int[] out);
-        byte[] readNdef();
-        boolean writeNdef(byte[] data);
-        NdefMessage findAndReadNdef();
-        boolean formatNdef(byte[] key);
-        boolean isNdefFormatable();
-        boolean makeReadOnly();
+        void onLlcpFirstPacketReceived(NfcDepEndpoint nfcDepEndpoint);
 
-        int getConnectedTechnology();
-    }
+        void onLlcpLinkActivated(NfcDepEndpoint nfcDepEndpoint);
 
-    public interface TagDisconnectedCallback {
-        void onTagDisconnected(long handle);
-    }
+        void onLlcpLinkDeactivated(NfcDepEndpoint nfcDepEndpoint);
 
-    public interface NfceeEndpoint {
-        // TODO flesh out multi-EE and use this
-    }
+        void onRemoteEndpointDiscovered(TagEndpoint tagEndpoint);
 
-    public interface NfcDepEndpoint {
+        void onRemoteFieldActivated();
 
-        /**
-         * Peer-to-Peer Target
-         */
-        public static final short MODE_P2P_TARGET = 0x00;
-        /**
-         * Peer-to-Peer Initiator
-         */
-        public static final short MODE_P2P_INITIATOR = 0x01;
-        /**
-         * Invalid target mode
-         */
-        public static final short MODE_INVALID = 0xff;
+        void onRemoteFieldDeactivated();
 
-        public byte[] receive();
+        void onSeApduReceived(byte[] bArr);
 
-        public boolean send(byte[] data);
+        void onSeEmvCardRemoval();
 
-        public boolean connect();
+        void onSeListenActivated();
 
-        public boolean disconnect();
+        void onSeListenDeactivated();
 
-        public byte[] transceive(byte[] data);
+        void onSeMifareAccess(byte[] bArr);
 
-        public int getHandle();
-
-        public int getMode();
-
-        public byte[] getGeneralBytes();
-
-        public byte getLlcpVersion();
-    }
-
-    public interface LlcpSocket {
-        public void connectToSap(int sap) throws IOException;
-
-        public void connectToService(String serviceName) throws IOException;
-
-        public void close() throws IOException;
-
-        public void send(byte[] data) throws IOException;
-
-        public int receive(byte[] recvBuff) throws IOException;
-
-        public int getRemoteMiu();
-
-        public int getRemoteRw();
-
-        public int getLocalSap();
-
-        public int getLocalMiu();
-
-        public int getLocalRw();
-    }
-
-    public interface LlcpServerSocket {
-        public LlcpSocket accept() throws IOException, LlcpException;
-
-        public void close() throws IOException;
+        void onUartAbnormal();
     }
 
     public interface LlcpConnectionlessSocket {
-        public int getLinkMiu();
+        void close() throws IOException;
 
-        public int getSap();
+        int getLinkMiu();
 
-        public void send(int sap, byte[] data) throws IOException;
+        int getSap();
 
-        public LlcpPacket receive() throws IOException;
+        LlcpPacket receive() throws IOException;
 
-        public void close() throws IOException;
+        void send(int i, byte[] bArr) throws IOException;
     }
 
-    /**
-     * Called at boot if NFC is disabled to give the device host an opportunity
-     * to check the firmware version to see if it needs updating. Normally the firmware version
-     * is checked during {@link #initialize(boolean enableScreenOffSuspend)},
-     * but the firmware may need to be updated after an OTA update.
-     *
-     * <p>This is called from a thread
-     * that may block for long periods of time during the update process.
-     */
-    public void checkFirmware();
+    public interface LlcpServerSocket {
+        LlcpSocket accept() throws IOException, LlcpException;
 
-    public boolean initialize();
+        void close() throws IOException;
+    }
 
-    public boolean deinitialize();
+    public interface LlcpSocket {
+        void close() throws IOException;
 
-    public String getName();
+        void connectToSap(int i) throws IOException;
 
-    public void enableDiscovery(NfcDiscoveryParameters params, boolean restart);
+        void connectToService(String str) throws IOException;
 
-    public void disableDiscovery();
+        int getLocalMiu();
 
-    public boolean sendRawFrame(byte[] data);
+        int getLocalRw();
 
-    public boolean routeAid(byte[] aid, int route);
+        int getLocalSap();
 
-    public boolean unrouteAid(byte[] aid);
+        int getRemoteMiu();
 
-    public boolean commitRouting();
+        int getRemoteRw();
 
-    public void registerT3tIdentifier(byte[] t3tIdentifier);
+        int receive(byte[] bArr) throws IOException;
 
-    public void deregisterT3tIdentifier(byte[] t3tIdentifier);
+        void send(byte[] bArr) throws IOException;
+    }
 
-    public void clearT3tIdentifiersCache();
+    public interface NfcDepEndpoint {
+        public static final short MODE_INVALID = (short) 255;
+        public static final short MODE_P2P_INITIATOR = (short) 1;
+        public static final short MODE_P2P_TARGET = (short) 0;
 
-    public int getLfT3tMax();
+        boolean connect();
 
-    public LlcpConnectionlessSocket createLlcpConnectionlessSocket(int nSap, String sn)
-            throws LlcpException;
+        boolean disconnect();
 
-    public LlcpServerSocket createLlcpServerSocket(int nSap, String sn, int miu,
-            int rw, int linearBufferLength) throws LlcpException;
+        byte[] getGeneralBytes();
 
-    public LlcpSocket createLlcpSocket(int sap, int miu, int rw,
-            int linearBufferLength) throws LlcpException;
+        int getHandle();
 
-    public boolean doCheckLlcp();
+        int getMode();
 
-    public boolean doActivateLlcp();
+        byte[] receive();
 
-    public void resetTimeouts();
+        boolean send(byte[] bArr);
 
-    public boolean setTimeout(int technology, int timeout);
+        byte[] transceive(byte[] bArr);
+    }
 
-    public int getTimeout(int technology);
+    public interface NfceeEndpoint {
+    }
 
-    public void doAbort();
+    public interface TagEndpoint {
+        boolean checkNdef(int[] iArr);
 
-    boolean canMakeReadOnly(int technology);
+        boolean connect(int i);
 
-    int getMaxTransceiveLength(int technology);
+        boolean disconnect();
 
-    void setP2pInitiatorModes(int modes);
+        NdefMessage findAndReadNdef();
 
-    void setP2pTargetModes(int modes);
+        boolean formatNdef(byte[] bArr);
 
-    boolean getExtendedLengthApdusSupported();
+        int getConnectedTechnology();
+
+        int getHandle();
+
+        Bundle[] getTechExtras();
+
+        int[] getTechList();
+
+        byte[] getUid();
+
+        boolean isNdefFormatable();
+
+        boolean isPresent();
+
+        boolean makeReadOnly();
+
+        boolean presenceCheck();
+
+        byte[] readNdef();
+
+        boolean reconnect();
+
+        void removeTechnology(int i);
+
+        void startPresenceChecking(int i);
+
+        byte[] transceive(byte[] bArr, boolean z, int[] iArr);
+
+        boolean writeNdef(byte[] bArr);
+    }
+
+    int GetDefaultSE();
+
+    int JCOSDownload();
+
+    int SWPSelfTest(int i);
+
+    boolean SetFilterTag(int i);
+
+    boolean canMakeReadOnly(int i);
+
+    void checkFirmware();
+
+    boolean clearAidTable();
+
+    void clearRouting();
+
+    void commitRouting();
+
+    LlcpConnectionlessSocket createLlcpConnectionlessSocket(int i, String str) throws LlcpException;
+
+    LlcpServerSocket createLlcpServerSocket(int i, String str, int i2, int i3, int i4) throws LlcpException;
+
+    LlcpSocket createLlcpSocket(int i, int i2, int i3, int i4) throws LlcpException;
+
+    boolean deinitialize();
+
+    void disableDiscovery();
+
+    boolean disableReaderMode();
+
+    void disableRoutingToHost();
+
+    void doAbort();
+
+    boolean doActivateLlcp();
+
+    boolean doCheckLlcp();
+
+    void doDeselectSecureElement(int i);
+
+    int[] doGetSecureElementList();
+
+    int doGetSecureElementTechList();
+
+    void doPrbsOff();
+
+    void doPrbsOn(int i, int i2);
+
+    void doSelectSecureElement(int i);
+
+    void doSetEEPROM(byte[] bArr);
+
+    void doSetSEPowerOffState(int i, boolean z);
+
+    void doSetScreenState(int i);
+
+    void doSetSecureElementListenTechMask(int i);
+
+    void doSetVenConfigValue(int i);
+
+    String dump();
+
+    void enableDiscovery();
+
+    boolean enablePN544Quirks();
+
+    boolean enableReaderMode(int i);
+
+    void enableRoutingToHost();
+
+    void enableTech_A(boolean z);
+
+    int getAidTableSize();
+
+    int getChipVer();
 
     int getDefaultLlcpMiu();
 
     int getDefaultLlcpRwSize();
 
-    String dump();
+    boolean getExtendedLengthApdusSupported();
 
-    boolean enableScreenOffSuspend();
+    int getFWVersion();
 
-    boolean disableScreenOffSuspend();
+    int getMaxTransceiveLength(int i);
+
+    String getName();
+
+    int getTimeout(int i);
+
+    byte[][] getWipeApdus();
+
+    boolean initialize(boolean z);
+
+    boolean onPpseRouted(boolean z, int i);
+
+    boolean reRouteAid(byte[] bArr, int i, boolean z, boolean z2);
+
+    void removeHceOffHostAidRoute(byte[] bArr);
+
+    void resetTimeouts();
+
+    void routToSecureElement(int i);
+
+    boolean routeAid(byte[] bArr, int i, int i2);
+
+    boolean sendRawFrame(byte[] bArr);
+
+    boolean setDefaultAidRoute(int i);
+
+    void setDefaultProtoRoute(int i, int i2, int i3);
+
+    boolean setDefaultRoute(int i, int i2, int i3);
+
+    void setDefaultRouteDestinations(int i, int i2);
+
+    void setDefaultTechRoute(int i, int i2, int i3);
+
+    void setHceOffHostAidRoute(byte[] bArr, boolean z, boolean z2, boolean z3, int i, boolean z4, boolean z5, boolean z6);
+
+    void setP2pInitiatorModes(int i);
+
+    void setP2pTargetModes(int i);
+
+    void setStaticRouteByProto(int i, boolean z, boolean z2, boolean z3, int i2, boolean z4, boolean z5, boolean z6);
+
+    void setStaticRouteByTech(int i, boolean z, boolean z2, boolean z3, int i2, boolean z4, boolean z5, boolean z6);
+
+    boolean setTimeout(int i, int i2);
+
+    void setUiccIdleTime(int i);
+
+    boolean unrouteAid(byte[] bArr);
 }

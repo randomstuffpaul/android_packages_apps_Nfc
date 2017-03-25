@@ -1,210 +1,154 @@
-/*
- * Copyright (C) 2011 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.android.nfc;
-
-import com.android.nfc.beam.SendUi;
 
 import android.app.NotificationManager;
 import android.content.Context;
-import android.content.res.Configuration;
+import android.content.Intent;
+import android.os.UserHandle;
 import android.os.Vibrator;
+import android.util.Log;
+import com.android.nfc.P2pEventListener.Callback;
 
-/**
- * Manages vibration, sound and animation for P2P events.
- */
-public class P2pEventManager implements P2pEventListener, SendUi.Callback {
+public class P2pEventManager implements P2pEventListener, Callback {
+    static final boolean DBG;
     static final String TAG = "NfcP2pEventManager";
-    static final boolean DBG = true;
-
-    static final long[] VIBRATION_PATTERN = {0, 100, 10000};
-
+    static final long[] VIBRATION_PATTERN;
+    final String ACTION_P2P_CONNECT;
+    final String ACTION_P2P_DISCONNECT;
+    final String ACTION_P2P_SEND_COMPLETE;
+    final Callback mCallback;
     final Context mContext;
-    final NfcService mNfcService;
-    final P2pEventListener.Callback mCallback;
-    final Vibrator mVibrator;
-    final NotificationManager mNotificationManager;
-    final SendUi mSendUi;
-
-    // only used on UI thread
-    boolean mSending;
-    boolean mNdefSent;
-    boolean mNdefReceived;
     boolean mInDebounce;
+    boolean mNdefReceived;
+    boolean mNdefSent;
+    final NfcService mNfcService;
+    final NotificationManager mNotificationManager;
+    public String[] mPacakgeList;
+    final SendUi mSendUi;
+    boolean mSending;
+    final Vibrator mVibrator;
 
-    public P2pEventManager(Context context, P2pEventListener.Callback callback) {
-        mNfcService = NfcService.getInstance();
-        mContext = context;
-        mCallback = callback;
-        mVibrator = (Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE);
-        mNotificationManager = (NotificationManager) mContext.getSystemService(
-                Context.NOTIFICATION_SERVICE);
+    static {
+        DBG = NfcService.DBG;
+        VIBRATION_PATTERN = new long[]{0, 100, 10000};
+    }
 
-        mSending = false;
-        final int uiModeType = mContext.getResources().getConfiguration().uiMode
-                & Configuration.UI_MODE_TYPE_MASK;
-        if (uiModeType == Configuration.UI_MODE_TYPE_APPLIANCE) {
-            // "Appliances" don't intrinsically have a way of confirming this, so we
-            // don't use the UI and just autoconfirm where necessary.
-            // Don't instantiate SendUi or else we'll use memory and never reclaim it.
-            mSendUi = null;
+    public P2pEventManager(Context context, Callback callback) {
+        this.ACTION_P2P_CONNECT = "android.nfc.action.P2P_CONNECT";
+        this.ACTION_P2P_DISCONNECT = "android.nfc.action.P2P_DISCONNECT";
+        this.ACTION_P2P_SEND_COMPLETE = "android.nfc.action.P2P_SEND_COMPLETE";
+        this.mPacakgeList = new String[]{"com.sec.android.directshare", "com.sec.android.directconnect"};
+        this.mNfcService = NfcService.getInstance();
+        this.mContext = context;
+        this.mCallback = callback;
+        this.mVibrator = (Vibrator) context.getSystemService("vibrator");
+        this.mNotificationManager = (NotificationManager) this.mContext.getSystemService("notification");
+        this.mSending = DBG;
+        if ((this.mContext.getResources().getConfiguration().uiMode & 15) == 5) {
+            this.mSendUi = null;
         } else {
-            mSendUi = new SendUi(context, this);
+            this.mSendUi = new SendUi(context, this);
         }
     }
 
-    @Override
     public void onP2pInRange() {
-        mNdefSent = false;
-        mNdefReceived = false;
-        mInDebounce = false;
-
-        if (mSendUi != null) {
-            mSendUi.takeScreenshot();
+        this.mNfcService.playSound(0);
+        this.mNdefSent = DBG;
+        this.mNdefReceived = DBG;
+        this.mInDebounce = DBG;
+        this.mVibrator.vibrate(VIBRATION_PATTERN, -1);
+        if (this.mSendUi != null) {
+            sendP2pEventBroadcast("android.nfc.action.P2P_CONNECT");
+            this.mSendUi.takeScreenshot();
         }
     }
 
-    @Override
-    public void onP2pNfcTapRequested() {
-        mNfcService.playSound(NfcService.SOUND_START);
-        mNdefSent = false;
-        mNdefReceived = false;
-        mInDebounce = false;
-
-        mVibrator.vibrate(VIBRATION_PATTERN, -1);
-        if (mSendUi != null) {
-            mSendUi.takeScreenshot();
-            mSendUi.showPreSend(true);
-        }
-    }
-
-    @Override
-    public void onP2pTimeoutWaitingForLink() {
-        if (mSendUi != null) {
-            mSendUi.finish(SendUi.FINISH_SCALE_UP);
-        }
-    }
-
-    @Override
     public void onP2pSendConfirmationRequested() {
-        mNfcService.playSound(NfcService.SOUND_START);
-        mVibrator.vibrate(VIBRATION_PATTERN, -1);
-        if (mSendUi != null) {
-            mSendUi.showPreSend(false);
+        if (this.mSendUi != null) {
+            this.mSendUi.showPreSend();
         } else {
-            mCallback.onP2pSendConfirmed();
+            this.mCallback.onP2pSendConfirmed();
         }
     }
 
-    @Override
+    public void sendP2pEventBroadcast(String action) {
+        for (int i = 0; i < this.mPacakgeList.length; i++) {
+            Intent intent = new Intent(action);
+            intent.setPackage(this.mPacakgeList[i]);
+            this.mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+            if (DBG) {
+                Log.d(TAG, "send p2p " + action + " event to " + this.mPacakgeList[i]);
+            }
+        }
+    }
+
     public void onP2pSendComplete() {
-        mNfcService.playSound(NfcService.SOUND_END);
-        mVibrator.vibrate(VIBRATION_PATTERN, -1);
-        if (mSendUi != null) {
-            mSendUi.finish(SendUi.FINISH_SEND_SUCCESS);
+        this.mNfcService.playSound(1);
+        this.mVibrator.vibrate(VIBRATION_PATTERN, -1);
+        if (this.mSendUi != null) {
+            this.mSendUi.finish(1);
         }
-        mSending = false;
-        mNdefSent = true;
+        this.mSending = DBG;
+        this.mNdefSent = true;
+        sendP2pEventBroadcast("android.nfc.action.P2P_SEND_COMPLETE");
     }
 
-    @Override
     public void onP2pHandoverNotSupported() {
-        mNfcService.playSound(NfcService.SOUND_ERROR);
-        mVibrator.vibrate(VIBRATION_PATTERN, -1);
-        mSendUi.finishAndToast(SendUi.FINISH_SCALE_UP,
-                mContext.getString(R.string.beam_handover_not_supported));
-        mSending = false;
-        mNdefSent = false;
+        this.mNfcService.playSound(2);
+        this.mVibrator.vibrate(VIBRATION_PATTERN, -1);
+        this.mSendUi.finishAndToast(0, this.mContext.getString(C0027R.string.beam_handover_not_supported));
+        this.mSending = DBG;
+        this.mNdefSent = DBG;
     }
 
-    @Override
-    public void onP2pHandoverBusy() {
-        mNfcService.playSound(NfcService.SOUND_ERROR);
-        mVibrator.vibrate(VIBRATION_PATTERN, -1);
-        mSendUi.finishAndToast(SendUi.FINISH_SCALE_UP, mContext.getString(R.string.beam_busy));
-        mSending = false;
-        mNdefSent = false;
-    }
-
-    @Override
     public void onP2pReceiveComplete(boolean playSound) {
-        mVibrator.vibrate(VIBRATION_PATTERN, -1);
-        if (playSound) mNfcService.playSound(NfcService.SOUND_END);
-        if (mSendUi != null) {
-            // TODO we still don't have a nice receive solution
-            // The sanest solution right now is just to scale back up what we had
-            // and start the new activity. It is not perfect, but at least it is
-            // consistent behavior. All other variants involve making the old
-            // activity screenshot disappear, and then removing the animation
-            // window hoping the new activity has started by then. This just goes
-            // wrong too often and can look weird.
-            mSendUi.finish(SendUi.FINISH_SCALE_UP);
+        this.mVibrator.vibrate(VIBRATION_PATTERN, -1);
+        if (playSound) {
+            this.mNfcService.playSound(1);
         }
-        mNdefReceived = true;
+        if (this.mSendUi != null) {
+            this.mSendUi.finish(0);
+        }
+        this.mNdefReceived = true;
     }
 
-    @Override
     public void onP2pOutOfRange() {
-        if (mSending) {
-            mNfcService.playSound(NfcService.SOUND_ERROR);
-            mSending = false;
+        if (this.mSending) {
+            this.mNfcService.playSound(2);
+            this.mSending = DBG;
         }
-        if (!mNdefSent && !mNdefReceived && mSendUi != null) {
-            mSendUi.finish(SendUi.FINISH_SCALE_UP);
+        if (!(this.mNdefSent || this.mNdefReceived || this.mSendUi == null)) {
+            this.mSendUi.finish(0);
         }
-        mInDebounce = false;
+        this.mInDebounce = DBG;
+        sendP2pEventBroadcast("android.nfc.action.P2P_DISCONNECT");
     }
 
-    @Override
     public void onSendConfirmed() {
-        if (!mSending) {
-            if (mSendUi != null) {
-                mSendUi.showStartSend();
+        if (!this.mSending) {
+            if (this.mSendUi != null) {
+                this.mSendUi.showStartSend();
             }
-            mCallback.onP2pSendConfirmed();
+            this.mCallback.onP2pSendConfirmed();
         }
-        mSending = true;
-
+        this.mSending = true;
     }
 
-    @Override
-    public void onCanceled() {
-        mSendUi.finish(SendUi.FINISH_SCALE_UP);
-        mCallback.onP2pCanceled();
-    }
-
-    @Override
     public void onP2pSendDebounce() {
-        mInDebounce = true;
-        mNfcService.playSound(NfcService.SOUND_ERROR);
-        if (mSendUi != null) {
-            mSendUi.showSendHint();
+        this.mInDebounce = true;
+        this.mNfcService.playSound(2);
+        if (this.mSendUi != null) {
+            this.mSendUi.showSendHint();
         }
     }
 
-    @Override
     public void onP2pResumeSend() {
-        mVibrator.vibrate(VIBRATION_PATTERN, -1);
-        mNfcService.playSound(NfcService.SOUND_START);
-        if (mInDebounce) {
-            if (mSendUi != null) {
-                mSendUi.showStartSend();
+        if (this.mInDebounce) {
+            this.mVibrator.vibrate(VIBRATION_PATTERN, -1);
+            this.mNfcService.playSound(0);
+            if (this.mSendUi != null) {
+                this.mSendUi.showStartSend();
             }
         }
-        mInDebounce = false;
+        this.mInDebounce = DBG;
     }
-
 }
