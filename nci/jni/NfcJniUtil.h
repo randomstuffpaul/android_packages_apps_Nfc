@@ -49,14 +49,14 @@
 
 
 /* Error codes */
-#define ERROR_BUFFER_TOO_SMALL            -12
-#define ERROR_INSUFFICIENT_RESOURCES      -9
+#define ERROR_BUFFER_TOO_SMALL            (-12)
+#define ERROR_INSUFFICIENT_RESOURCES      (-9)
 
 
 /* Pre-defined tag type values. These must match the values in
  * Ndef.java in the framework.
  */
-#define NDEF_UNKNOWN_TYPE                -1
+#define NDEF_UNKNOWN_TYPE                (-1)
 #define NDEF_TYPE1_TAG                   1
 #define NDEF_TYPE2_TAG                   2
 #define NDEF_TYPE3_TAG                   3
@@ -73,12 +73,12 @@
 
 
 /* Name strings for target types. These *must* match the values in TagTechnology.java */
-#define TARGET_TYPE_UNKNOWN               -1
+#define TARGET_TYPE_UNKNOWN               (-1)
 #define TARGET_TYPE_ISO14443_3A           1
 #define TARGET_TYPE_ISO14443_3B           2
 #define TARGET_TYPE_ISO14443_4            3
 #define TARGET_TYPE_FELICA                4
-#define TARGET_TYPE_ISO15693              5
+#define TARGET_TYPE_V                     5
 #define TARGET_TYPE_NDEF                  6
 #define TARGET_TYPE_NDEF_FORMATABLE       7
 #define TARGET_TYPE_MIFARE_CLASSIC        8

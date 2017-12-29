@@ -41,6 +41,7 @@ import android.util.Log;
 import android.util.EventLog;
 import android.webkit.URLUtil;
 import android.Manifest.permission;
+import android.widget.Toast;
 
 import com.android.internal.R;
 
@@ -148,7 +149,8 @@ public class BeamShareActivity extends Activity {
     }
 
     public void parseShareIntentAndFinish(Intent intent) {
-        if (intent == null || (!intent.getAction().equalsIgnoreCase(Intent.ACTION_SEND) &&
+        if (intent == null || intent.getAction() == null ||
+                (!intent.getAction().equalsIgnoreCase(Intent.ACTION_SEND) &&
                 !intent.getAction().equalsIgnoreCase(Intent.ACTION_SEND_MULTIPLE))) return;
 
         // First, see if the intent contains clip-data, and if so get data from there
@@ -221,6 +223,9 @@ public class BeamShareActivity extends Activity {
                     if (uri.getScheme().equalsIgnoreCase("file") &&
                             getApplicationContext().checkPermission(permission.READ_EXTERNAL_STORAGE, -1, uid) !=
                             PackageManager.PERMISSION_GRANTED) {
+                        Toast.makeText(getApplicationContext(),
+                                        com.android.nfc.R.string.beam_requires_external_storage_permission,
+                                        Toast.LENGTH_SHORT).show();
                         Log.e(TAG, "File based Uri doesn't have External Storage Permission.");
                         EventLog.writeEvent(0x534e4554, "37287958", uid, uri.getPath());
                         break;

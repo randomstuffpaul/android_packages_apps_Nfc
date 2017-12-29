@@ -154,6 +154,7 @@ public class CardEmulationManager implements RegisteredServicesCache.Callback,
         mHostNfcFEmulationManager.onUserSwitched();
         mT3tIdentifiersCache.onUserSwitched();
         mEnabledNfcFServices.onUserSwitched(userId);
+        mNfcFServicesCache.onUserSwitched();
         mNfcFServicesCache.invalidateCache(userId);
     }
 
@@ -356,7 +357,7 @@ public class CardEmulationManager implements RegisteredServicesCache.Callback,
                 throws RemoteException {
             NfcPermissions.validateUserId(userId);
             NfcPermissions.enforceAdminPermissions(mContext);
-            if (!isServiceRegistered(userId, service)) {
+            if (service != null && !isServiceRegistered(userId, service)) {
                 return false;
             }
             return mPreferredServices.setDefaultForNextTap(service);

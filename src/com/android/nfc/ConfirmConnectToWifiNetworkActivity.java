@@ -82,6 +82,7 @@ public class ConfirmConnectToWifiNetworkActivity extends Activity
     }
 
     private void doConnect(WifiManager wifiManager) {
+        mCurrentWifiConfiguration.hiddenSSID = true;
         int networkId = wifiManager.addNetwork(mCurrentWifiConfiguration);
 
         if (networkId < 0) {
@@ -121,6 +122,7 @@ public class ConfirmConnectToWifiNetworkActivity extends Activity
 
     @Override
     protected void onDestroy() {
+        mAlertDialog.dismiss();
         ConfirmConnectToWifiNetworkActivity.this.unregisterReceiver(mBroadcastReceiver);
         super.onDestroy();
     }

@@ -26,6 +26,7 @@ import com.android.nfc.DeviceHost;
 import com.android.nfc.LlcpException;
 import com.android.nfc.NfcDiscoveryParameters;
 
+import java.io.FileDescriptor;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.HashMap;
@@ -84,6 +85,21 @@ public class NativeNfcManager implements DeviceHost {
         return ret;
     }
 
+    private native void doEnableDtaMode();
+
+    @Override
+    public void enableDtaMode() {
+        doEnableDtaMode();
+    }
+
+    private native void doDisableDtaMode();
+
+    @Override
+    public void disableDtaMode() {
+        Log.d(TAG,"disableDtaMode : entry");
+        doDisableDtaMode();
+    }
+
     private native boolean doDeinitialize();
 
     @Override
@@ -100,7 +116,7 @@ public class NativeNfcManager implements DeviceHost {
     public native boolean sendRawFrame(byte[] data);
 
     @Override
-    public native boolean routeAid(byte[] aid, int route);
+    public native boolean routeAid(byte[] aid, int route, int aidInfo);
 
     @Override
     public native boolean unrouteAid(byte[] aid);
@@ -147,6 +163,12 @@ public class NativeNfcManager implements DeviceHost {
 
     @Override
     public native int getLfT3tMax();
+
+    @Override
+    public native void doSetScreenState(int screen_state_mask);
+
+    @Override
+    public native int getNciVersion();
 
     private native void doEnableDiscovery(int techMask,
                                           boolean enableLowPowerPolling,
@@ -251,7 +273,7 @@ public class NativeNfcManager implements DeviceHost {
     }
 
     @Override
-    public native void doAbort();
+    public native void doAbort(String msg);
 
     private native boolean doSetTimeout(int tech, int timeout);
     @Override
@@ -325,10 +347,10 @@ public class NativeNfcManager implements DeviceHost {
         return DEFAULT_LLCP_RWSIZE;
     }
 
-    private native String doDump();
+    private native void doDump(FileDescriptor fd);
     @Override
-    public String dump() {
-        return doDump();
+    public void dump(FileDescriptor fd) {
+        doDump(fd);
     }
 
     private native void doEnableScreenOffSuspend();
